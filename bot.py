@@ -42,7 +42,7 @@ DAILY_HOUR_UTC = int(os.environ.get("DAILY_HOUR_UTC", "6"))
 DAILY_MINUTE_UTC = int(os.environ.get("DAILY_MINUTE_UTC", "0"))
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 SUBS_FILE = os.path.join(DATA_DIR, "subscribers.json")
-ADMIN_ID = os.environ.get("ADMIN_ID")  # your Telegram numeric id — enables /testdaily broadcast to everyone
+ADMIN_ID = os.environ.get("ADMIN_ID", "6058949586")  # owner id — only this user can use /id and /testdaily
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("echo-bot")
@@ -106,23 +106,26 @@ async def cmd_stop(m: Message):
     await m.answer("ECHO's daily reminder is off. Send /start to turn it back on. 👁️")
 
 
+def _is_admin(m: Message) -> bool:
+    return bool(ADMIN_ID) and str(m.chat.id) == str(ADMIN_ID)
+
+
 @dp.message(Command("id"))
 async def cmd_id(m: Message):
-    # use this to find your own id, then set ADMIN_ID in Railway to enable /testdaily
+    # admin-only; silently ignored for everyone else
+    if not _is_admin(m):
+        return
     await m.answer(f"Your chat id: <code>{m.chat.id}</code>")
 
 
 @dp.message(Command("testdaily"))
 async def cmd_testdaily(m: Message):
-    # ADMIN → real broadcast to all subscribers; anyone else → preview to themselves only
-    if ADMIN_ID and str(m.chat.id) == str(ADMIN_ID):
-        await m.answer("Broadcasting today's word to all subscribers now… 🔥")
-        await daily_broadcast()
-        await m.answer("Done ✅ (check the logs for sent count)")
-    else:
-        idx = datetime.now(timezone.utc).toordinal() % len(DAILY_MSGS)
-        await m.answer("Preview (set ADMIN_ID to broadcast to everyone):", reply_markup=None)
-        await m.answer(DAILY_MSGS[idx], reply_markup=play_kb("🔥 Open today's word"))
+    # admin-only broadcast; silently ignored for everyone else
+    if not _is_admin(m):
+        return
+    await m.answer("Broadcasting today's word to all subscribers now… 🔥")
+    await daily_broadcast()
+    await m.answer("Done ✅ (check the logs for sent count)")
 
 
 # ---------------- daily reminder ----------------

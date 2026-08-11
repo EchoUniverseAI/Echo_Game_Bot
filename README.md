@@ -1,62 +1,62 @@
-# ECHO Universe — بوت اللعبة (Python / aiogram v3)
+# ECHO Universe — Game Bot (Python / aiogram v3)
 
-بوت تيليجرام مخصّص للعبة ECHO: زر **Play ECHO** يفتح الـMini App، و**إشعار يومي** يرجّع اللاعبين لكلمة ECHO اليومية. يعمل على Railway كخدمة طويلة التشغيل (long-polling).
+A dedicated Telegram bot for the ECHO game: a **Play ECHO** button that opens the Mini App, and a **daily reminder** that brings players back to ECHO's daily word. Runs on Railway as a long‑polling worker.
 
 ---
 
-## 1) أنشئ البوت في BotFather
-1. افتح **@BotFather** → `/newbot` → اختر اسماً و username (مثلاً `EchoUniverseGameBot`).
-2. انسخ **التوكن** (BOT_TOKEN) — ستضعه في Railway.
-3. (اختياري) `/setdescription` و`/setuserpic` لهوية البوت. زر «Play ECHO» يضبطه الكود تلقائياً عند التشغيل.
+## 1) Create the bot in BotFather
+1. Open **@BotFather** → `/newbot` → choose a name and username (e.g. `EchoUniverseGameBot`).
+2. Copy the **token** (BOT_TOKEN) — you'll paste it into Railway.
+3. (Optional) `/setdescription` and `/setuserpic` for the bot's identity. The **Play ECHO** button is set automatically by the code on startup.
 
-## 2) انشر على Railway
-1. Railway → **New Service** → من مستودع Git يحتوي هذه الملفات (أو ارفع المجلد).
-2. Railway يكتشف Python تلقائياً عبر `requirements.txt`، ويشغّل `Procfile` (`worker: python bot.py`).
-3. **Variables** — أضِف:
+## 2) Deploy on Railway
+1. Railway → **New Service** → from a Git repo containing these files (or upload the folder).
+2. Railway auto-detects Python via `requirements.txt` and runs the `Procfile` (`worker: python bot.py`).
+3. **Variables** — add:
 
-| المتغيّر | القيمة |
+| Variable | Value |
 |---|---|
-| `BOT_TOKEN` | توكن BotFather (إلزامي) |
+| `BOT_TOKEN` | BotFather token (required) |
 | `GAME_URL` | `https://echo-games.netlify.app` |
-| `DAILY_HOUR_UTC` | `6`  ← 6 UTC = 9:00 صباحاً بتوقيت الرياض |
+| `DAILY_HOUR_UTC` | `6`  ← 6 UTC = 9:00 AM Riyadh |
 | `DAILY_MINUTE_UTC` | `0` |
 | `DATA_DIR` | `/data` |
+| `ADMIN_ID` | (optional) your numeric id — enables `/testdaily` broadcast |
 
-4. **مهم — أضِف Volume للاستمرارية:** Railway → Service → **Volumes** → أنشئ Volume ووصّله على المسار `/data`. بدونه تُفقد قائمة المشتركين عند كل إعادة نشر (لأن نظام ملفات Railway مؤقّت).
+4. **Important — add a Volume for persistence:** Railway → Service → **Volumes** → create a Volume mounted at `/data`. Without it, the subscriber list is lost on every redeploy (Railway's filesystem is ephemeral).
 
-## 3) وقت الإشعار اليومي
-الوقت بتوقيت **UTC**. الرياض = UTC+3، فاطرح 3 ساعات:
-- 9:00 صباحاً الرياض → `DAILY_HOUR_UTC=6`
-- 8:00 مساءً الرياض → `DAILY_HOUR_UTC=17`
+## 3) Daily reminder time
+Time is in **UTC**. Riyadh = UTC+3, so subtract 3 hours:
+- 9:00 AM Riyadh → `DAILY_HOUR_UTC=6`
+- 8:00 PM Riyadh → `DAILY_HOUR_UTC=17`
 
-## 4) ادعُ الجروب للاختبار
-- شارك رابط البوت: `https://t.me/EchoUniverseGameBot` (استبدله باسم بوتك).
-- كل من يضغط **Start** يشترك تلقائياً في الكلمة اليومية، ويظهر له زر **Play ECHO** أسفل المحادثة.
-- ملاحظة: أزرار Mini App تعمل في المحادثات الخاصة؛ في الجروب شارك رابط البوت لا زر WebApp.
+## 4) Invite the group to test
+- Share the bot link: `https://t.me/EchoUniverseGameBot` (replace with your bot's username).
+- Anyone who taps **Start** is auto-subscribed to the daily word and gets the **Play ECHO** button under the chat.
+- Note: Mini App buttons work in private chats; in a group, share the bot link (not a WebApp button).
 
-## الأوامر
-- `/start` — ترحيب + زر اللعب + اشتراك في الكلمة اليومية
-- `/play` — إعادة إرسال زر اللعب
-- `/stop` — إيقاف التذكير اليومي
-- `/id` — يعرض معرّفك (chat id)
-- `/testdaily` — اختبار الإشعار اليومي فوراً
+## Commands
+- `/start` — welcome + play button + subscribe to the daily word (everyone)
+- `/play` — resend the play button (everyone)
+- `/stop` — turn off the daily reminder (everyone)
+- `/id` — shows your chat id (**admin only**, ignored for others)
+- `/testdaily` — broadcast today's reminder to all subscribers now (**admin only**, ignored for others)
 
-## كيف تختبر الإشعار اليومي فوراً (بدون انتظار الوقت المجدول)
-1. أرسل `/start` للبوت (تصير مشتركاً).
-2. أرسل `/id` — انسخ الرقم الظاهر.
-3. في Railway → Variables، أضِف `ADMIN_ID` = ذلك الرقم، ثم أعِد النشر.
-4. أرسل `/testdaily` — البوت يرسل إشعار اليوم **لكل المشتركين** فوراً (اختبار حقيقي).
+## Admin
+`ADMIN_ID` defaults to the owner's Telegram id in the code. Only that user can use `/id` and `/testdaily`; for everyone else these commands are silently ignored. To change the admin, set the `ADMIN_ID` variable in Railway.
 
-> بدون `ADMIN_ID`: أمر `/testdaily` يريك **معاينة** للإشعار لك وحدك فقط (لا يُرسل للجميع).
+## Test the daily reminder instantly (no waiting for the scheduled time)
+1. Send `/start` to the bot (you become a subscriber).
+2. As the admin, send `/testdaily` — the bot sends today's reminder to **all subscribers** immediately (a real test). You'll see a "sent=N" line in the Railway logs.
 
-## ملفات المشروع
-- `bot.py` — البوت (aiogram v3)
-- `requirements.txt` — الاعتماديات
-- `Procfile` — أمر التشغيل على Railway
-- `.env.example` — نموذج المتغيّرات (للتشغيل محلياً: انسخه إلى `.env`)
-- `runtime.txt` — إصدار Python
+## Project files
+- `bot.py` — the bot (aiogram v3)
+- `requirements.txt` — dependencies
+- `Procfile` — Railway start command
+- `.env.example` — variable template (for local runs: copy it to `.env`)
+- `runtime.txt` — Python version
 
-## تشغيل محلي (اختياري)
+## Run locally (optional)
 ```bash
 pip install -r requirements.txt
 export BOT_TOKEN=xxxx GAME_URL=https://echo-games.netlify.app DATA_DIR=.
