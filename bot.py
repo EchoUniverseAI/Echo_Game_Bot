@@ -42,6 +42,7 @@ DAILY_HOUR_UTC = int(os.environ.get("DAILY_HOUR_UTC", "6"))
 DAILY_MINUTE_UTC = int(os.environ.get("DAILY_MINUTE_UTC", "0"))
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 SUBS_FILE = os.path.join(DATA_DIR, "subscribers.json")
+ADMIN_ID = os.environ.get("ADMIN_ID")  # your Telegram numeric id — enables /testdaily broadcast to everyone
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("echo-bot")
@@ -77,9 +78,9 @@ def play_kb(text: str = "▶ Play ECHO") -> InlineKeyboardMarkup:
 
 
 WELCOME = (
-    "👁️ <b>ECHO</b> — علّمه أن يكون إنساناً.\n\n"
-    "كل يوم عند ECHO <b>كلمة لك</b>، ورحلة دروس <b>تعيشها</b> لا تقرؤها فقط.\n"
-    "اضغط للّعب، وارجع كل يوم لكلمة ECHO الجديدة وحافظ على سلسلتك. 🔥"
+    "👁️ <b>ECHO</b> — teach it to be human.\n\n"
+    "Every day ECHO has <b>a word for you</b>, and a journey of lessons you <b>live</b>, not just read.\n"
+    "Tap to play, and come back each day for ECHO's new word to keep your streak alive. 🔥"
 )
 
 # ---------------- handlers ----------------
@@ -93,7 +94,7 @@ async def cmd_start(m: Message):
 
 @dp.message(Command("play"))
 async def cmd_play(m: Message):
-    await m.answer("العب ECHO الآن 👇", reply_markup=play_kb())
+    await m.answer("Play ECHO now 👇", reply_markup=play_kb())
 
 
 @dp.message(Command("stop"))
@@ -102,15 +103,34 @@ async def cmd_stop(m: Message):
     if m.chat.id in subs:
         subs.discard(m.chat.id)
         save_subs(subs)
-    await m.answer("تم إيقاف تذكير ECHO اليومي. أرسل /start لتعود إليه. 👁️")
+    await m.answer("ECHO's daily reminder is off. Send /start to turn it back on. 👁️")
+
+
+@dp.message(Command("id"))
+async def cmd_id(m: Message):
+    # use this to find your own id, then set ADMIN_ID in Railway to enable /testdaily
+    await m.answer(f"Your chat id: <code>{m.chat.id}</code>")
+
+
+@dp.message(Command("testdaily"))
+async def cmd_testdaily(m: Message):
+    # ADMIN → real broadcast to all subscribers; anyone else → preview to themselves only
+    if ADMIN_ID and str(m.chat.id) == str(ADMIN_ID):
+        await m.answer("Broadcasting today's word to all subscribers now… 🔥")
+        await daily_broadcast()
+        await m.answer("Done ✅ (check the logs for sent count)")
+    else:
+        idx = datetime.now(timezone.utc).toordinal() % len(DAILY_MSGS)
+        await m.answer("Preview (set ADMIN_ID to broadcast to everyone):", reply_markup=None)
+        await m.answer(DAILY_MSGS[idx], reply_markup=play_kb("🔥 Open today's word"))
 
 
 # ---------------- daily reminder ----------------
 DAILY_MSGS = [
-    "👁️ ECHO عنده كلمة جديدة لك اليوم — لا تكسر سلسلتك. 🔥",
-    "ECHO ينتظرك. كلمة اليوم جاهزة. 👁️",
-    "درسٌ يومي صغير، وتقدّمٌ يكبر. افتح ECHO الآن. 🔥",
-    "خطوة واحدة اليوم مع ECHO تُبقي رحلتك حيّة. 👁️",
+    "👁️ ECHO has a new word for you today — don't break your streak. 🔥",
+    "ECHO is waiting. Today's word is ready. 👁️",
+    "A small daily lesson, and growth that adds up. Open ECHO now. 🔥",
+    "One step today with ECHO keeps your journey alive. 👁️",
 ]
 
 
@@ -124,7 +144,7 @@ async def daily_broadcast():
     sent, dead = 0, []
     for cid in list(subs):
         try:
-            await bot.send_message(cid, text, reply_markup=play_kb("🔥 افتح كلمة اليوم"))
+            await bot.send_message(cid, text, reply_markup=play_kb("🔥 Open today's word"))
             sent += 1
             await asyncio.sleep(0.05)  # stay under Telegram rate limits
         except Exception as e:
