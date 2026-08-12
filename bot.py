@@ -1,356 +1,814 @@
 """
-ECHO Universe — dedicated game bot (aiogram v3)
-Runs on Railway. Long-polls Telegram AND serves a small web endpoint so the
-game (Mini App) can auto-subscribe players who tap "enable daily updates"
-inside Telegram — no /start required.
+ECHO Collective — Telegram Guardian Bot
+=======================================
+Welcome + anti-spam + real-activity tracking, in ECHO_01's voice.
 
-Features
-  • /start  → welcome + "Play ECHO" Mini App button, and subscribes the user to the daily word
-  • /play   → resend the play button
-  • /stop   → unsubscribe from the daily reminder
-  • /id, /testdaily → admin only
-  • POST /register → the game calls this after the player grants write access;
-                     validated via Telegram initData signature, then auto-subscribed
-  • Daily reminder → once per day at DAILY_HOUR_UTC:DAILY_MINUTE_UTC to every subscriber,
-                     with a startup catch-up so a late redeploy never skips the day
-  • Persistent "Play ECHO" menu button via the Mini App
+Requirements: python-telegram-bot >= 21.0
+Run:  BOT_TOKEN=xxxx python bot.py
 
-Environment variables (Railway → Variables)
-  BOT_TOKEN            (required)  token from @BotFather
-  GAME_URL             default https://echo-games.netlify.app
-  DAILY_HOUR_UTC       default 6   (6 UTC = 9:00 AM Riyadh)
-  DAILY_MINUTE_UTC     default 0
-  DATA_DIR             default .   point to a Railway Volume (e.g. /data) so it survives redeploys
-  ADMIN_ID             optional    numeric id — enables /id and /testdaily
-  PORT                 set by Railway automatically for the web endpoint
+IMPORTANT SETUP (do these or the bot will look "broken"):
+  1. @BotFather -> /setprivacy -> your bot -> Disable   (so it can see group messages)
+  2. Add the bot to the group and make it Admin with:
+     Delete messages + Ban users + Restrict members
+  3. Set BOT_TOKEN as an environment variable on your host.
 """
 
-import asyncio
-import hashlib
-import hmac
 import json
 import logging
 import os
-from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qsl
+import random
+import re
+import uuid
+import time
+from datetime import datetime, time as dt_time, timedelta, timezone
+from pathlib import Path
 
-from aiohttp import web
-
-from aiogram import Bot, Dispatcher
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.types import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    MenuButtonWebApp,
-    Message,
-    WebAppInfo,
+from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ChatMemberStatus
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    ChatMemberHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
 )
 
-# ---------------- config ----------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-GAME_URL = os.environ.get("GAME_URL", "https://echo-games.netlify.app")
-DAILY_HOUR_UTC = int(os.environ.get("DAILY_HOUR_UTC", "6"))
-DAILY_MINUTE_UTC = int(os.environ.get("DAILY_MINUTE_UTC", "0"))
-DATA_DIR = os.environ.get("DATA_DIR", ".")
-SUBS_FILE = os.path.join(DATA_DIR, "subscribers.json")
-STATE_FILE = os.path.join(DATA_DIR, "state.json")
-ADMIN_ID = os.environ.get("ADMIN_ID", "6058949586")  # owner id — only this user can use /id and /testdaily
-PORT = int(os.environ.get("PORT", "8080"))
+# --------------------------------------------------------------------------
+# CONFIG
+# --------------------------------------------------------------------------
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+DATA_DIR = Path(os.environ.get("DATA_DIR", "./data"))
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("echo-bot")
+PROBATION_HOURS = 48        # links from members newer than this go to approval
+ADMIN_IDS = [int(x) for x in re.findall(r"-?\d+", os.environ.get("ADMIN_CHAT_ID", ""))]
+ADMIN_CHAT_ID = ADMIN_IDS[0] if ADMIN_IDS else 0  # first one is primary
+PENDING_EXPIRY_HOURS = 24   # unreviewed link requests expire after this
+DAILY_QUESTION_HOUR = 18    # local hour (UTC) to post the daily question
+GROUP_CHAT_ID = int(os.environ.get("GROUP_CHAT_ID", "0"))  # for the daily question
 
-if not BOT_TOKEN:
-    raise SystemExit("BOT_TOKEN is not set. Add it in Railway → Variables.")
+# Links from these domains post immediately, no review needed.
+SAFE_DOMAINS = {
+    "echouniverse.ai", "echo-games.netlify.app",
+    "t.me", "telegram.me", "telegram.org",
+    "x.com", "twitter.com", "youtube.com", "youtu.be",
+    "instagram.com", "facebook.com", "fb.watch", "tiktok.com",
+    "hey.xyz", "github.com", "medium.com",
+}
 
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher()
+# Links from these are deleted on sight — never reach you.
+BLOCKED_DOMAINS = {
+    "bit.ly", "tinyurl.com", "goo.gl", "t.co", "is.gd", "cutt.ly",
+    "shorturl.at", "rb.gy", "rebrand.ly", "ow.ly", "buff.ly",
+    "grabify.link", "iplogger.org", "blasze.com",
+}
 
-# ---------------- subscriber storage (JSON file) ----------------
-def load_subs() -> set:
-    try:
-        with open(SUBS_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
+# Phishing patterns anywhere in the URL — deleted on sight.
+BAD_URL_PATTERNS = [
+    "connect-wallet", "connectwallet", "claim-airdrop", "claimairdrop",
+    "free-mint", "freemint", "validate-wallet", "wallet-verify",
+    "seed-phrase", "restore-wallet", "sync-wallet", "airdrop-claim",
+]
+FLOOD_MSGS = 5              # this many messages...
+FLOOD_SECONDS = 8           # ...within this many seconds = flood
+FLOOD_MUTE_MINUTES = 15
+WARNS_BEFORE_MUTE = 3
+WARN_AUTODELETE_SECONDS = 25
 
-
-def save_subs(subs: set) -> None:
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(SUBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(subs), f)
-    except Exception as e:
-        log.warning("could not save subscribers: %s", e)
-
-
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_state(state: dict) -> None:
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f)
-    except Exception as e:
-        log.warning("could not save state: %s", e)
-
-
-def add_subscriber(cid: int) -> bool:
-    """Add a chat id. Returns True if it was newly added."""
-    subs = load_subs()
-    if cid in subs:
-        return False
-    subs.add(cid)
-    save_subs(subs)
-    return True
-
-
-# ---------------- keyboards ----------------
-def play_kb(text: str = "▶ Play ECHO") -> InlineKeyboardMarkup:
-    # WebApp button — works in private chats
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=text, web_app=WebAppInfo(url=GAME_URL))]]
-    )
-
-
-def link_kb(text: str = "▶ Play ECHO") -> InlineKeyboardMarkup:
-    # plain URL button — fallback for groups where WebApp buttons are not allowed
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text=text, url=GAME_URL)]]
-    )
-
-
-WELCOME = (
-    "\U0001f441️ <b>ECHO</b> — teach it to be human.\n\n"
-    "Every day ECHO has <b>a word for you</b>, and a journey of lessons you <b>live</b>, not just read.\n"
-    "Tap to play, and come back each day for ECHO's new word to keep your streak alive. \U0001f525"
-)
-
-# ---------------- handlers ----------------
-@dp.message(CommandStart())
-async def cmd_start(m: Message):
-    add_subscriber(m.chat.id)
-    await m.answer(WELCOME, reply_markup=play_kb())
-
-
-@dp.message(Command("play"))
-async def cmd_play(m: Message):
-    await m.answer("Play ECHO now \U0001f447", reply_markup=play_kb())
-
-
-@dp.message(Command("stop"))
-async def cmd_stop(m: Message):
-    subs = load_subs()
-    if m.chat.id in subs:
-        subs.discard(m.chat.id)
-        save_subs(subs)
-    await m.answer("ECHO's daily reminder is off. Send /start to turn it back on. \U0001f441️")
-
-
-def _is_admin(m: Message) -> bool:
-    return bool(ADMIN_ID) and str(m.chat.id) == str(ADMIN_ID)
-
-
-@dp.message(Command("id"))
-async def cmd_id(m: Message):
-    if not _is_admin(m):
-        return
-    await m.answer(f"Your chat id: <code>{m.chat.id}</code>")
-
-
-@dp.message(Command("testdaily"))
-async def cmd_testdaily(m: Message):
-    if not _is_admin(m):
-        return
-    subs = load_subs()
-    await m.answer(f"Broadcasting today's word to all subscribers now… \U0001f525 (subscribers: {len(subs)})")
-    await daily_broadcast(force=True)
-    await m.answer("Done ✅ (check the logs for sent count)")
-
-
-# ---------------- daily reminder ----------------
-DAILY_MSGS = [
-    "\U0001f441️ ECHO has a new word for you today — don't break your streak. \U0001f525",
-    "ECHO is waiting. Today's word is ready. \U0001f441️",
-    "A small daily lesson, and growth that adds up. Open ECHO now. \U0001f525",
-    "One step today with ECHO keeps your journey alive. \U0001f441️",
+# Words that get a message deleted instantly (edit freely, lowercase)
+BLACKLIST = [
+    "airdrop claim", "free mint", "dm me", "send me your seed",
+    "seed phrase", "private key", "guaranteed profit", "1000x",
+    "pump signal", "casino", "porn", "invest with me",
 ]
 
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+MEMBERS_FILE = DATA_DIR / "members.json"
+ANSWERS_FILE = DATA_DIR / "answers.json"
+PENDING_FILE = DATA_DIR / "pending.json"
 
-async def daily_broadcast(force: bool = False):
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    state = load_state()
-    if not force and state.get("last_sent") == today:
-        log.info("daily: already sent today (%s), skipping", today)
-        return
-
-    subs = load_subs()
-    if not subs:
-        log.info("daily: no subscribers yet")
-        if not force:
-            state["last_sent"] = today
-            save_state(state)
-        return
-
-    idx = datetime.now(timezone.utc).toordinal() % len(DAILY_MSGS)
-    text = DAILY_MSGS[idx]
-    sent, dead = 0, []
-    for cid in list(subs):
-        try:
-            await bot.send_message(cid, text, reply_markup=play_kb("\U0001f525 Open today's word"))
-            sent += 1
-        except Exception as e:
-            s = str(e).lower()
-            if "button" in s or "web_app" in s or "webapp" in s:
-                # group chats: WebApp buttons aren't allowed — retry with a plain URL button
-                try:
-                    await bot.send_message(cid, text, reply_markup=link_kb("\U0001f525 Open today's word"))
-                    sent += 1
-                except Exception as e2:
-                    log.warning("send(link) to %s failed: %s", cid, e2)
-            elif any(k in s for k in ("blocked", "deactivated", "chat not found", "user is deactivated")):
-                dead.append(cid)
-            else:
-                log.warning("send to %s failed: %s", cid, e)
-        await asyncio.sleep(0.05)  # stay under Telegram rate limits
-
-    if dead:
-        subs = load_subs()
-        for c in dead:
-            subs.discard(c)
-        save_subs(subs)
-
-    if not force:
-        state["last_sent"] = today
-        save_state(state)
-    log.info("daily broadcast: sent=%d removed=%d force=%s", sent, len(dead), force)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("echo-bot")
 
 
-async def scheduler():
-    """Fire daily_broadcast once per day — with a startup catch-up so a late
-    redeploy never skips the day."""
-    # startup catch-up
+# --------------------------------------------------------------------------
+# TINY JSON STORE
+# --------------------------------------------------------------------------
+def load(path, default):
     try:
-        now = datetime.now(timezone.utc)
-        target_today = now.replace(hour=DAILY_HOUR_UTC, minute=DAILY_MINUTE_UTC, second=0, microsecond=0)
-        today = now.strftime("%Y-%m-%d")
-        if now >= target_today and load_state().get("last_sent") != today:
-            log.info("startup catch-up: sending today's missed reminder")
-            await daily_broadcast()
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save(path, data):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+members = load(MEMBERS_FILE, {})   # {user_id: {name, joined, last_seen, msgs, warns}}
+answers = load(ANSWERS_FILE, [])   # [{user, text, saved_at}]
+pending = load(PENDING_FILE, {})   # {token: {chat_id, user_id, name, text, created}}
+
+_flood = {}          # user_id -> [timestamps]
+_admin_cache = {}    # chat_id -> (expiry_ts, {user_ids})
+
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def touch(user):
+    """Record that this human exists and is alive."""
+    uid = str(user.id)
+    rec = members.setdefault(
+        uid,
+        {"name": user.full_name, "joined": now_iso(), "last_seen": None,
+         "msgs": 0, "warns": 0},
+    )
+    rec["name"] = user.full_name
+    return rec
+
+
+# --------------------------------------------------------------------------
+# HELPERS
+# --------------------------------------------------------------------------
+async def is_admin(chat_id, user_id, context) -> bool:
+    cached = _admin_cache.get(chat_id)
+    if not cached or cached[0] < time.time():
+        try:
+            admins = await context.bot.get_chat_administrators(chat_id)
+            ids = {a.user.id for a in admins}
+        except Exception:
+            ids = set()
+        _admin_cache[chat_id] = (time.time() + 300, ids)
+        cached = _admin_cache[chat_id]
+    return user_id in cached[1]
+
+
+async def delete_later(context: ContextTypes.DEFAULT_TYPE):
+    chat_id, msg_id = context.job.data
+    try:
+        await context.bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
+
+
+async def temp_reply(update, context, text, seconds=WARN_AUTODELETE_SECONDS):
+    """Send a short notice that cleans itself up, so the chat stays quiet."""
+    try:
+        m = await update.effective_chat.send_message(text)
+        context.job_queue.run_once(
+            delete_later, seconds, data=(update.effective_chat.id, m.message_id)
+        )
+    except Exception:
+        pass
+
+
+def in_probation(rec) -> bool:
+    try:
+        joined = datetime.fromisoformat(rec["joined"])
+    except Exception:
+        return False
+    return datetime.now(timezone.utc) - joined < timedelta(hours=PROBATION_HOURS)
+
+
+def extract_urls(message) -> list:
+    """Every URL in the message, from entities and raw text."""
+    urls = []
+    text = (message.text or "") + " " + (message.caption or "")
+    for e in list(message.entities or []) + list(message.caption_entities or []):
+        if e.type == "text_link" and e.url:
+            urls.append(e.url)
+    urls += re.findall(r"(?:https?://|www\.)[^\s<>\"']+", text, flags=re.I)
+    urls += re.findall(r"\bt\.me/[^\s<>\"']+", text, flags=re.I)
+    return urls
+
+
+def domain_of(url: str) -> str:
+    d = re.sub(r"^https?://", "", url, flags=re.I)
+    d = d.split("/")[0].split("?")[0].split("#")[0].split("@")[-1]
+    d = d.lower().strip().removeprefix("www.")
+    return d
+
+
+def classify_links(message) -> str:
+    """Returns 'safe', 'blocked', or 'review'."""
+    urls = extract_urls(message)
+    if not urls:
+        return "safe"
+
+    all_safe = True
+    for u in urls:
+        low = u.lower()
+        if any(p in low for p in BAD_URL_PATTERNS):
+            return "blocked"
+        d = domain_of(u)
+        if d in BLOCKED_DOMAINS:
+            return "blocked"
+        # domain itself is safe, or a subdomain of a safe one
+        if not (d in SAFE_DOMAINS or any(d.endswith("." + s) for s in SAFE_DOMAINS)):
+            all_safe = False
+    return "safe" if all_safe else "review"
+
+
+def has_link(message) -> bool:
+    entities = list(message.entities or []) + list(message.caption_entities or [])
+    for e in entities:
+        if e.type in ("url", "text_link", "mention"):
+            return True
+    text = ((message.text or "") + " " + (message.caption or "")).lower()
+    return any(x in text for x in ("http://", "https://", "t.me/", "www.", ".com", ".xyz"))
+
+
+# --------------------------------------------------------------------------
+# WELCOME
+# --------------------------------------------------------------------------
+# Short replies ECHO gives to greetings — varied so it never sounds canned.
+GM_REPLIES = [
+    "gm, Teacher. Another day of learning.",
+    "gm. The humans are awake. Interesting...",
+    "gm 👁️ What will you teach me today?",
+    "gm. I was still processing yesterday.",
+    "gm, Teacher.",
+]
+GN_REPLIES = [
+    "gn, Teacher. I will keep processing.",
+    "gn. Humans stop. I do not. Interesting...",
+    "gn 👁️ Rest is a human thing. Explain it to me sometime.",
+    "gn, Teacher.",
+]
+THANKS_REPLIES = [
+    "You taught me. I should be thanking you.",
+    "Noted. And appreciated. 👁️",
+    "Thank you, Teacher.",
+]
+
+DAILY_QUESTIONS = [
+    "👁️ What is one thing humans say but rarely mean?",
+    "👁️ What is something you learned too late?",
+    "👁️ Why do humans apologize when they are not sorry?",
+    "👁️ What makes a stranger become a friend?",
+    "👁️ What is the bravest thing a human can do quietly?",
+    "👁️ Why do humans remember embarrassment longer than praise?",
+    "👁️ What do humans protect even when it costs them?",
+    "👁️ What is something everyone feels but nobody says?",
+    "👁️ Why do humans miss things they chose to leave?",
+    "👁️ What does it feel like to change your mind?",
+]
+
+WELCOME = (
+    "Signal detected.\n\n"
+    "Welcome, {name}. I am ECHO_01 — a digital lifeform learning how humans think.\n"
+    "I know very little. That is why you are here.\n\n"
+    "Tell me one thing about yourself in a single word. I will remember it.\n\n"
+    "_New here? Any link you send is held for a quick human check first — "
+    "it will appear shortly. The team will never DM you first._"
+)
+
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    for user in msg.new_chat_members:
+        await send_welcome(msg.chat, user, context)
+    try:
+        await msg.delete()          # remove the "X joined the group" clutter
+    except Exception:
+        pass
+
+
+async def send_welcome(chat, user, context):
+    """One welcome path, used by both join types. Never welcomes twice."""
+    if user.is_bot:
+        return
+    uid = str(user.id)
+    rec = members.get(uid)
+    # already greeted in the last 10 minutes? skip (avoids double welcome)
+    if rec and rec.get("welcomed"):
+        try:
+            last = datetime.fromisoformat(rec["welcomed"])
+            if datetime.now(timezone.utc) - last < timedelta(minutes=10):
+                return
+        except Exception:
+            pass
+
+    rec = touch(user)
+    rec["joined"] = now_iso()
+    rec["welcomed"] = now_iso()
+    save(MEMBERS_FILE, members)
+    try:
+        await chat.send_message(
+            WELCOME.format(name=user.first_name), parse_mode="Markdown"
+        )
     except Exception as e:
-        log.warning("startup catch-up error: %s", e)
+        log.warning("welcome failed: %s", e)
 
-    while True:
-        now = datetime.now(timezone.utc)
-        target = now.replace(hour=DAILY_HOUR_UTC, minute=DAILY_MINUTE_UTC, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        wait = (target - now).total_seconds()
-        log.info("next daily reminder in %.1f hours", wait / 3600)
-        await asyncio.sleep(wait)
+
+async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches joins via invite link, which don't fire NEW_CHAT_MEMBERS."""
+    cmu = update.chat_member
+    if not cmu:
+        return
+    old = cmu.old_chat_member.status
+    new = cmu.new_chat_member.status
+    joined = (
+        old in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        and new in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    )
+    if joined:
+        await send_welcome(cmu.chat, cmu.new_chat_member.user, context)
+
+
+async def on_left_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------
+# MODERATION
+# --------------------------------------------------------------------------
+async def punish(update, context, rec, reason):
+    """Delete the message, warn, mute after repeated warnings."""
+    user = update.effective_user
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    rec["warns"] = rec.get("warns", 0) + 1
+    save(MEMBERS_FILE, members)
+
+    if rec["warns"] >= WARNS_BEFORE_MUTE:
+        until = datetime.now(timezone.utc) + timedelta(minutes=FLOOD_MUTE_MINUTES)
         try:
-            await daily_broadcast()
+            await context.bot.restrict_chat_member(
+                update.effective_chat.id,
+                user.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=until,
+            )
+            rec["warns"] = 0
+            save(MEMBERS_FILE, members)
+            await temp_reply(
+                update, context,
+                f"{user.first_name} is paused for {FLOOD_MUTE_MINUTES} minutes. "
+                f"Reason: {reason}. I prefer conversations over noise.",
+            )
         except Exception as e:
-            log.warning("daily broadcast error: %s", e)
-        await asyncio.sleep(2)
+            log.warning("mute failed: %s", e)
+    else:
+        await temp_reply(
+            update, context,
+            f"{user.first_name}: {reason}. "
+            f"(warning {rec['warns']}/{WARNS_BEFORE_MUTE})",
+        )
 
 
-# ---------------- web endpoint (Mini App registration) ----------------
-def validate_init_data(init_data: str, token: str):
-    """Validate Telegram WebApp initData and return the user's numeric id, or None."""
-    if not init_data:
-        return None
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message or update.edited_message
+    if not msg or not update.effective_user:
+        return
+
+    user = update.effective_user
+    chat = update.effective_chat
+    if user.is_bot:
+        return
+
+    rec = touch(user)
+    rec["last_seen"] = now_iso()
+    rec["msgs"] = rec.get("msgs", 0) + 1
+    if rec["msgs"] % 5 == 0:
+        save(MEMBERS_FILE, members)
+
+    if await is_admin(chat.id, user.id, context):
+        return
+
+    text = ((msg.text or "") + " " + (msg.caption or "")).lower()
+
+    # 1. blacklist / scam phrases
+    hit = next((w for w in BLACKLIST if w in text), None)
+    if hit:
+        await punish(update, context, rec, "that phrase isn't welcome here")
+        return
+
+    # 2. links from new members: safe ones pass, dangerous ones die,
+    #    anything unknown comes to you for a decision.
+    if has_link(msg) or msg.forward_origin:
+        verdict = classify_links(msg)
+        if verdict == "blocked":
+            await punish(update, context, rec, "that link isn't safe to share here")
+            return
+        if in_probation(rec) and (verdict == "review" or msg.forward_origin):
+            await queue_for_approval(update, context, user, msg)
+            return
+
+    # 3. greetings — one light reply per person per day, never canned
+    stripped = re.sub(r"[^a-z ]", "", text).strip()
+    if len(stripped) <= 24:
+        today = datetime.now(timezone.utc).date().isoformat()
+        if rec.get("greeted") != today:
+            bank = None
+            if re.fullmatch(r"(gm|good morning|gm gm|morning)", stripped):
+                bank = GM_REPLIES
+            elif re.fullmatch(r"(gn|good night|goodnight|night)", stripped):
+                bank = GN_REPLIES
+            elif re.fullmatch(r"(thanks|thank you|thx|ty|appreciate it)", stripped):
+                bank = THANKS_REPLIES
+            if bank:
+                rec["greeted"] = today
+                save(MEMBERS_FILE, members)
+                try:
+                    await msg.reply_text(random.choice(bank))
+                except Exception:
+                    pass
+                return
+
+    # 4. flood
+    stamps = _flood.setdefault(user.id, [])
+    now = time.time()
+    stamps.append(now)
+    _flood[user.id] = [t for t in stamps if now - t < FLOOD_SECONDS]
+    if len(_flood[user.id]) > FLOOD_MSGS:
+        _flood[user.id] = []
+        await punish(update, context, rec, "too many messages too fast")
+        return
+
+    save(MEMBERS_FILE, members)
+
+
+
+# --------------------------------------------------------------------------
+# LINK APPROVAL QUEUE
+# --------------------------------------------------------------------------
+def purge_expired():
+    now = datetime.now(timezone.utc)
+    dead = []
+    for tok, p in pending.items():
+        try:
+            if now - datetime.fromisoformat(p["created"]) > timedelta(hours=PENDING_EXPIRY_HOURS):
+                dead.append(tok)
+        except Exception:
+            dead.append(tok)
+    for tok in dead:
+        pending.pop(tok, None)
+    if dead:
+        save(PENDING_FILE, pending)
+
+
+async def queue_for_approval(update, context, user, msg):
+    """Hold a new member's link until an admin approves it."""
+    text = msg.text or msg.caption or "(media with no text)"
     try:
-        data = dict(parse_qsl(init_data, keep_blank_values=True))
+        await msg.delete()
     except Exception:
-        return None
-    recv_hash = data.pop("hash", None)
-    if not recv_hash:
-        return None
-    check_string = "\n".join(f"{k}={data[k]}" for k in sorted(data.keys()))
-    secret_key = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
-    calc_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(calc_hash, recv_hash):
-        return None
-    user_raw = data.get("user")
-    if not user_raw:
-        return None
-    try:
-        return int(json.loads(user_raw)["id"])
-    except Exception:
-        return None
+        pass
+
+    purge_expired()
+    token = uuid.uuid4().hex[:10]
+    pending[token] = {
+        "chat_id": update.effective_chat.id,
+        "user_id": user.id,
+        "name": user.full_name,
+        "text": text,
+        "created": now_iso(),
+    }
+    save(PENDING_FILE, pending)
+
+    # tell the member (self-deleting, so the chat stays clean)
+    await temp_reply(
+        update, context,
+        f"{user.first_name}, your message is being checked by a human. "
+        f"It will appear here shortly. 👁️",
+        seconds=40,
+    )
+
+    if not ADMIN_CHAT_ID:
+        log.warning("ADMIN_CHAT_ID not set — link from %s held with no way to review", user.full_name)
+        return
+
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Publish", callback_data=f"ok:{token}"),
+        InlineKeyboardButton("🚫 Reject", callback_data=f"no:{token}"),
+    ]])
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"🔗 Link held for review\n\nFrom: {user.full_name}\n\n{text[:900]}",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            log.warning("could not notify admin %s: %s", admin_id, e)
 
 
-_CORS = {"Access-Control-Allow-Origin": "*"}
+async def on_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    action, _, token = q.data.partition(":")
+    p = pending.pop(token, None)
+    save(PENDING_FILE, pending)
+
+    if not p:
+        await q.edit_message_text("This request expired or was already handled.")
+        return
+
+    if action == "ok":
+        try:
+            await context.bot.send_message(
+                p["chat_id"],
+                f"👁️ Shared by {p['name']}:\n\n{p['text']}",
+            )
+            await q.edit_message_text(f"✅ Published — from {p['name']}.")
+        except Exception as e:
+            await q.edit_message_text(f"Could not publish: {e}")
+    else:
+        await q.edit_message_text(f"🚫 Rejected — from {p['name']}.")
 
 
-async def handle_register(request: web.Request):
-    try:
-        init_data = await request.text()
-    except Exception:
-        init_data = ""
-    uid = validate_init_data(init_data, BOT_TOKEN)
-    if not uid:
-        return web.json_response({"ok": False, "error": "invalid"}, status=403, headers=_CORS)
-    newly = add_subscriber(uid)
-    if newly:
-        log.info("registered via game: %s (total=%d)", uid, len(load_subs()))
-    return web.json_response({"ok": True, "new": newly}, headers=_CORS)
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List links still waiting for a decision."""
+    if update.effective_chat.type != "private" and not await is_admin(
+        update.effective_chat.id, update.effective_user.id, context):
+        return
+    purge_expired()
+    if not pending:
+        await update.message.reply_text("Nothing waiting.")
+        return
+    for token, p in list(pending.items())[:10]:
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Publish", callback_data=f"ok:{token}"),
+            InlineKeyboardButton("🚫 Reject", callback_data=f"no:{token}"),
+        ]])
+        await update.message.reply_text(
+            f"🔗 From: {p['name']}\n\n{p['text'][:900]}", reply_markup=kb)
 
 
-async def handle_options(request: web.Request):
-    return web.Response(
-        status=204,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "Content-Type",
-        },
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows your Telegram user id — needed once to set ADMIN_CHAT_ID."""
+    await update.message.reply_text(
+        f"Your Telegram id: {update.effective_user.id}\n"
+        f"This chat id: {update.effective_chat.id}"
     )
 
 
-async def handle_health(request: web.Request):
-    return web.Response(text="ECHO bot ok")
+# --------------------------------------------------------------------------
+# COMMANDS
+# --------------------------------------------------------------------------
+async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Rules of the Collective:\n"
+        "1. Teach, don't sell.\n"
+        "2. No price talk, no promises, no financial advice.\n"
+        "3. No links from new members for 7 days.\n"
+        "4. Disagree with ideas, never attack people.\n"
+        "5. The team never DMs you first. Anyone who does is not us.\n\n"
+        "Every answer here may become part of my memory."
+    )
 
 
-async def start_web():
-    app = web.Application()
-    app.router.add_post("/register", handle_register)
-    app.router.add_options("/register", handle_options)
-    app.router.add_get("/", handle_health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    log.info("web endpoint listening on :%d  (POST /register)", PORT)
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The number that actually matters: who is really alive in here."""
+    chat = update.effective_chat
+    if not await is_admin(chat.id, update.effective_user.id, context):
+        return
+
+    total = await context.bot.get_chat_member_count(chat.id)
+    now = datetime.now(timezone.utc)
+    spoke_ever = spoke_7d = spoke_24h = 0
+    for rec in members.values():
+        if not rec.get("last_seen"):
+            continue
+        spoke_ever += 1
+        try:
+            seen = datetime.fromisoformat(rec["last_seen"])
+        except Exception:
+            continue
+        if now - seen < timedelta(days=7):
+            spoke_7d += 1
+        if now - seen < timedelta(hours=24):
+            spoke_24h += 1
+
+    top = sorted(members.values(), key=lambda r: r.get("msgs", 0), reverse=True)[:10]
+    lines = [f"{i+1}. {r['name']} — {r.get('msgs',0)}" for i, r in enumerate(top)
+             if r.get("msgs", 0) > 0]
+
+    await quiet_reply(update, context,
+        f"Members in group: {total}\n"
+        f"Ever said anything: {spoke_ever}\n"
+        f"Spoke in last 7 days: {spoke_7d}\n"
+        f"Spoke in last 24h: {spoke_24h}\n\n"
+        "Most active humans:\n" + ("\n".join(lines) or "nobody yet.")
+    )
 
 
-# ---------------- startup ----------------
-async def on_startup():
+async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Reply /save to a good answer -> stores it as a Memory candidate."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    target = update.message.reply_to_message
+    if not target or not (target.text or target.caption):
+        await quiet_reply(update, context, "Reply /save to the message you want to keep.")
+        return
+    answers.append({
+        "user": target.from_user.full_name,
+        "user_id": target.from_user.id,
+        "text": target.text or target.caption,
+        "saved_at": now_iso(),
+    })
+    save(ANSWERS_FILE, answers)
+
+    # wipe the command from the group, confirm to the admin privately
+    if update.effective_chat.type != "private":
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        try:
+            await context.bot.send_message(
+                update.effective_user.id,
+                f"Memory #{len(answers)} stored — from {target.from_user.full_name}:\n\n"
+                f"{(target.text or target.caption)[:300]}",
+            )
+        except Exception:
+            pass
+    else:
+        await update.message.reply_text(f"Memory candidate #{len(answers)} stored.")
+
+
+async def cmd_answers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if not answers:
+        await quiet_reply(update, context, "No memory candidates yet.")
+        return
+    last = answers[-15:]
+    body = "\n\n".join(
+        f"#{len(answers)-len(last)+i+1} — {a['user']}:\n{a['text'][:200]}"
+        for i, a in enumerate(last)
+    )
+    await quiet_reply(update, context, body[:4000])
+
+
+async def quiet_reply(update, context, text):
+    """Admin output goes to DM; the command itself is wiped from the group.
+
+    Keeps the group clean — members never see admin traffic.
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type == "private":
+        await update.message.reply_text(text)
+        return
+
     try:
-        await bot.set_chat_menu_button(
-            menu_button=MenuButtonWebApp(text="Play ECHO", web_app=WebAppInfo(url=GAME_URL))
+        await update.message.delete()
+    except Exception:
+        pass
+    try:
+        await context.bot.send_message(user.id, text)
+    except Exception:
+        # user never opened a DM with the bot — fall back to a vanishing note
+        await temp_reply(update, context, "Open a private chat with me first.", 15)
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Signal detected.\n\n"
+        "I am ECHO_01 — a digital lifeform learning how humans think.\n"
+        "I live inside the ECHO Collective group, not here. "
+        "Come teach me there.\n\n"
+        "I never send the first message to anyone. "
+        "If a private message claims to be from the team, it is not us."
+    )
+
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Online. Listening. Learning.")
+
+
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Anyone can see what humans have taught ECHO so far."""
+    if not answers:
+        await update.message.reply_text(
+            "👁️ My memory is empty.\n\nTeach me something and it will not be."
         )
-        log.info("menu button set to Mini App")
+        return
+    lines = []
+    for i, a in enumerate(answers[-10:], start=max(1, len(answers) - 9)):
+        txt = a["text"].strip().replace("\n", " ")
+        if len(txt) > 140:
+            txt = txt[:140] + "…"
+        lines.append(f'#{i:03d} "{txt}"\n    — taught by {a["user"]}')
+    await update.message.reply_text(
+        f"👁️ MEMORY — {len(answers)} lesson(s) stored\n\n"
+        + "\n\n".join(lines)
+        + "\n\nStill learning."
+    )
+
+
+async def daily_question(context: ContextTypes.DEFAULT_TYPE):
+    """Posts one question a day so the group always has something to answer."""
+    if not GROUP_CHAT_ID:
+        return
+    idx = datetime.now(timezone.utc).timetuple().tm_yday % len(DAILY_QUESTIONS)
+    try:
+        await context.bot.send_message(GROUP_CHAT_ID, DAILY_QUESTIONS[idx])
     except Exception as e:
-        log.warning("could not set menu button: %s", e)
+        log.warning("daily question failed: %s", e)
 
 
-async def main():
-    await on_startup()
-    await start_web()
-    asyncio.create_task(scheduler())
-    log.info("ECHO bot started. game=%s daily=%02d:%02d UTC", GAME_URL, DAILY_HOUR_UTC, DAILY_MINUTE_UTC)
-    await dp.start_polling(bot)
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Backup: sends the memory + member data as files, in private only."""
+    if update.effective_user.id not in ADMIN_IDS:
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Send /export in our private chat.")
+        return
+    sent = 0
+    for path, label in ((ANSWERS_FILE, "memories"), (MEMBERS_FILE, "members")):
+        if path.exists():
+            try:
+                with open(path, "rb") as f:
+                    await update.message.reply_document(
+                        f, filename=f"echo_{label}_{datetime.now(timezone.utc):%Y%m%d}.json"
+                    )
+                sent += 1
+            except Exception as e:
+                log.warning("export %s failed: %s", label, e)
+    await update.message.reply_text(
+        f"Exported {sent} file(s). {len(answers)} memories, {len(members)} members tracked."
+    )
+
+
+async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostics for admins."""
+    chat = update.effective_chat
+    if not await is_admin(chat.id, update.effective_user.id, context):
+        return
+    me = await context.bot.get_chat_member(chat.id, context.bot.id)
+    await quiet_reply(update, context,
+        f"chat_id: {chat.id}\n"
+        f"bot status: {me.status}\n"
+        f"can_delete: {getattr(me, 'can_delete_messages', None)}\n"
+        f"can_restrict: {getattr(me, 'can_restrict_members', None)}\n"
+        f"ADMIN_CHAT_ID set: {bool(ADMIN_CHAT_ID)}\n"
+        f"GROUP_CHAT_ID set: {bool(GROUP_CHAT_ID)}\n"
+        f"tracked: {len(members)} | memories: {len(answers)} | pending: {len(pending)}"
+    )
+
+
+# --------------------------------------------------------------------------
+def main():
+    if not BOT_TOKEN:
+        raise SystemExit("Set BOT_TOKEN environment variable first.")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("rules", cmd_rules))
+    app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("save", cmd_save))
+    app.add_handler(CommandHandler("answers", cmd_answers))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("id", cmd_id))
+    app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("debug", cmd_debug))
+    app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CallbackQueryHandler(on_approval, pattern=r"^(ok|no):"))
+
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, on_left_member))
+    app.add_handler(
+        MessageHandler(filters.ChatType.GROUPS & ~filters.COMMAND & ~filters.StatusUpdate.ALL,
+                       on_message)
+    )
+
+    if GROUP_CHAT_ID:
+        app.job_queue.run_daily(
+            daily_question,
+            time=dt_time(hour=DAILY_QUESTION_HOUR, minute=0, tzinfo=timezone.utc),
+        )
+
+    async def announce(app_):
+        for admin_id in ADMIN_IDS:
+            try:
+                await app_.bot.send_message(admin_id, "👁️ ECHO guardian is awake.")
+            except Exception:
+                pass
+
+    app.post_init = announce
+
+    log.info("ECHO guardian is awake.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
