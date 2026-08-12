@@ -1,27 +1,40 @@
 """
 ECHO Universe — dedicated game bot (aiogram v3)
-Runs on Railway as a long-polling worker.
+Runs on Railway. Long-polls Telegram AND serves a small web endpoint so the
+game (Mini App) can auto-subscribe players who tap "enable daily updates"
+inside Telegram — no /start required.
 
 Features
   • /start  → welcome + "Play ECHO" Mini App button, and subscribes the user to the daily word
   • /play   → resend the play button
   • /stop   → unsubscribe from the daily reminder
-  • Daily reminder → once per day at DAILY_HOUR_UTC:DAILY_MINUTE_UTC to every subscriber
-  • Persistent "Play ECHO" menu button (bottom-left of the chat) via the Mini App
+  • /id, /testdaily → admin only
+  • POST /register → the game calls this after the player grants write access;
+                     validated via Telegram initData signature, then auto-subscribed
+  • Daily reminder → once per day at DAILY_HOUR_UTC:DAILY_MINUTE_UTC to every subscriber,
+                     with a startup catch-up so a late redeploy never skips the day
+  • Persistent "Play ECHO" menu button via the Mini App
 
-Environment variables (set these in Railway → Variables)
-  BOT_TOKEN            (required)  token from @BotFather for the new game bot
-  GAME_URL             default https://echo-games.netlify.app   the Mini App URL
-  DAILY_HOUR_UTC       default 6   hour (UTC) to send the daily word  (6 UTC = 9:00 AM Riyadh)
+Environment variables (Railway → Variables)
+  BOT_TOKEN            (required)  token from @BotFather
+  GAME_URL             default https://echo-games.netlify.app
+  DAILY_HOUR_UTC       default 6   (6 UTC = 9:00 AM Riyadh)
   DAILY_MINUTE_UTC     default 0
-  DATA_DIR             default .   where subscribers.json is stored — point to a Railway Volume (e.g. /data) so it survives redeploys
+  DATA_DIR             default .   point to a Railway Volume (e.g. /data) so it survives redeploys
+  ADMIN_ID             optional    numeric id — enables /id and /testdaily
+  PORT                 set by Railway automatically for the web endpoint
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qsl
+
+from aiohttp import web
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -42,7 +55,9 @@ DAILY_HOUR_UTC = int(os.environ.get("DAILY_HOUR_UTC", "6"))
 DAILY_MINUTE_UTC = int(os.environ.get("DAILY_MINUTE_UTC", "0"))
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 SUBS_FILE = os.path.join(DATA_DIR, "subscribers.json")
+STATE_FILE = os.path.join(DATA_DIR, "state.json")
 ADMIN_ID = os.environ.get("ADMIN_ID", "6058949586")  # owner id — only this user can use /id and /testdaily
+PORT = int(os.environ.get("PORT", "8080"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("echo-bot")
@@ -71,30 +86,64 @@ def save_subs(subs: set) -> None:
         log.warning("could not save subscribers: %s", e)
 
 
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_state(state: dict) -> None:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as e:
+        log.warning("could not save state: %s", e)
+
+
+def add_subscriber(cid: int) -> bool:
+    """Add a chat id. Returns True if it was newly added."""
+    subs = load_subs()
+    if cid in subs:
+        return False
+    subs.add(cid)
+    save_subs(subs)
+    return True
+
+
+# ---------------- keyboards ----------------
 def play_kb(text: str = "▶ Play ECHO") -> InlineKeyboardMarkup:
+    # WebApp button — works in private chats
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=text, web_app=WebAppInfo(url=GAME_URL))]]
     )
 
 
+def link_kb(text: str = "▶ Play ECHO") -> InlineKeyboardMarkup:
+    # plain URL button — fallback for groups where WebApp buttons are not allowed
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=text, url=GAME_URL)]]
+    )
+
+
 WELCOME = (
-    "👁️ <b>ECHO</b> — teach it to be human.\n\n"
+    "\U0001f441️ <b>ECHO</b> — teach it to be human.\n\n"
     "Every day ECHO has <b>a word for you</b>, and a journey of lessons you <b>live</b>, not just read.\n"
-    "Tap to play, and come back each day for ECHO's new word to keep your streak alive. 🔥"
+    "Tap to play, and come back each day for ECHO's new word to keep your streak alive. \U0001f525"
 )
 
 # ---------------- handlers ----------------
 @dp.message(CommandStart())
 async def cmd_start(m: Message):
-    subs = load_subs()
-    subs.add(m.chat.id)
-    save_subs(subs)
+    add_subscriber(m.chat.id)
     await m.answer(WELCOME, reply_markup=play_kb())
 
 
 @dp.message(Command("play"))
 async def cmd_play(m: Message):
-    await m.answer("Play ECHO now 👇", reply_markup=play_kb())
+    await m.answer("Play ECHO now \U0001f447", reply_markup=play_kb())
 
 
 @dp.message(Command("stop"))
@@ -103,7 +152,7 @@ async def cmd_stop(m: Message):
     if m.chat.id in subs:
         subs.discard(m.chat.id)
         save_subs(subs)
-    await m.answer("ECHO's daily reminder is off. Send /start to turn it back on. 👁️")
+    await m.answer("ECHO's daily reminder is off. Send /start to turn it back on. \U0001f441️")
 
 
 def _is_admin(m: Message) -> bool:
@@ -112,7 +161,6 @@ def _is_admin(m: Message) -> bool:
 
 @dp.message(Command("id"))
 async def cmd_id(m: Message):
-    # admin-only; silently ignored for everyone else
     if not _is_admin(m):
         return
     await m.answer(f"Your chat id: <code>{m.chat.id}</code>")
@@ -120,52 +168,86 @@ async def cmd_id(m: Message):
 
 @dp.message(Command("testdaily"))
 async def cmd_testdaily(m: Message):
-    # admin-only broadcast; silently ignored for everyone else
     if not _is_admin(m):
         return
-    await m.answer("Broadcasting today's word to all subscribers now… 🔥")
-    await daily_broadcast()
+    subs = load_subs()
+    await m.answer(f"Broadcasting today's word to all subscribers now… \U0001f525 (subscribers: {len(subs)})")
+    await daily_broadcast(force=True)
     await m.answer("Done ✅ (check the logs for sent count)")
 
 
 # ---------------- daily reminder ----------------
 DAILY_MSGS = [
-    "👁️ ECHO has a new word for you today — don't break your streak. 🔥",
-    "ECHO is waiting. Today's word is ready. 👁️",
-    "A small daily lesson, and growth that adds up. Open ECHO now. 🔥",
-    "One step today with ECHO keeps your journey alive. 👁️",
+    "\U0001f441️ ECHO has a new word for you today — don't break your streak. \U0001f525",
+    "ECHO is waiting. Today's word is ready. \U0001f441️",
+    "A small daily lesson, and growth that adds up. Open ECHO now. \U0001f525",
+    "One step today with ECHO keeps your journey alive. \U0001f441️",
 ]
 
 
-async def daily_broadcast():
+async def daily_broadcast(force: bool = False):
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    state = load_state()
+    if not force and state.get("last_sent") == today:
+        log.info("daily: already sent today (%s), skipping", today)
+        return
+
     subs = load_subs()
     if not subs:
         log.info("daily: no subscribers yet")
+        if not force:
+            state["last_sent"] = today
+            save_state(state)
         return
+
     idx = datetime.now(timezone.utc).toordinal() % len(DAILY_MSGS)
     text = DAILY_MSGS[idx]
     sent, dead = 0, []
     for cid in list(subs):
         try:
-            await bot.send_message(cid, text, reply_markup=play_kb("🔥 Open today's word"))
+            await bot.send_message(cid, text, reply_markup=play_kb("\U0001f525 Open today's word"))
             sent += 1
-            await asyncio.sleep(0.05)  # stay under Telegram rate limits
         except Exception as e:
             s = str(e).lower()
-            if any(k in s for k in ("blocked", "deactivated", "chat not found", "user is deactivated")):
+            if "button" in s or "web_app" in s or "webapp" in s:
+                # group chats: WebApp buttons aren't allowed — retry with a plain URL button
+                try:
+                    await bot.send_message(cid, text, reply_markup=link_kb("\U0001f525 Open today's word"))
+                    sent += 1
+                except Exception as e2:
+                    log.warning("send(link) to %s failed: %s", cid, e2)
+            elif any(k in s for k in ("blocked", "deactivated", "chat not found", "user is deactivated")):
                 dead.append(cid)
             else:
                 log.warning("send to %s failed: %s", cid, e)
+        await asyncio.sleep(0.05)  # stay under Telegram rate limits
+
     if dead:
         subs = load_subs()
         for c in dead:
             subs.discard(c)
         save_subs(subs)
-    log.info("daily broadcast: sent=%d removed=%d", sent, len(dead))
+
+    if not force:
+        state["last_sent"] = today
+        save_state(state)
+    log.info("daily broadcast: sent=%d removed=%d force=%s", sent, len(dead), force)
 
 
 async def scheduler():
-    """Fire daily_broadcast once per day at the configured UTC time."""
+    """Fire daily_broadcast once per day — with a startup catch-up so a late
+    redeploy never skips the day."""
+    # startup catch-up
+    try:
+        now = datetime.now(timezone.utc)
+        target_today = now.replace(hour=DAILY_HOUR_UTC, minute=DAILY_MINUTE_UTC, second=0, microsecond=0)
+        today = now.strftime("%Y-%m-%d")
+        if now >= target_today and load_state().get("last_sent") != today:
+            log.info("startup catch-up: sending today's missed reminder")
+            await daily_broadcast()
+    except Exception as e:
+        log.warning("startup catch-up error: %s", e)
+
     while True:
         now = datetime.now(timezone.utc)
         target = now.replace(hour=DAILY_HOUR_UTC, minute=DAILY_MINUTE_UTC, second=0, microsecond=0)
@@ -181,8 +263,78 @@ async def scheduler():
         await asyncio.sleep(2)
 
 
+# ---------------- web endpoint (Mini App registration) ----------------
+def validate_init_data(init_data: str, token: str):
+    """Validate Telegram WebApp initData and return the user's numeric id, or None."""
+    if not init_data:
+        return None
+    try:
+        data = dict(parse_qsl(init_data, keep_blank_values=True))
+    except Exception:
+        return None
+    recv_hash = data.pop("hash", None)
+    if not recv_hash:
+        return None
+    check_string = "\n".join(f"{k}={data[k]}" for k in sorted(data.keys()))
+    secret_key = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
+    calc_hash = hmac.new(secret_key, check_string.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc_hash, recv_hash):
+        return None
+    user_raw = data.get("user")
+    if not user_raw:
+        return None
+    try:
+        return int(json.loads(user_raw)["id"])
+    except Exception:
+        return None
+
+
+_CORS = {"Access-Control-Allow-Origin": "*"}
+
+
+async def handle_register(request: web.Request):
+    try:
+        init_data = await request.text()
+    except Exception:
+        init_data = ""
+    uid = validate_init_data(init_data, BOT_TOKEN)
+    if not uid:
+        return web.json_response({"ok": False, "error": "invalid"}, status=403, headers=_CORS)
+    newly = add_subscriber(uid)
+    if newly:
+        log.info("registered via game: %s (total=%d)", uid, len(load_subs()))
+    return web.json_response({"ok": True, "new": newly}, headers=_CORS)
+
+
+async def handle_options(request: web.Request):
+    return web.Response(
+        status=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type",
+        },
+    )
+
+
+async def handle_health(request: web.Request):
+    return web.Response(text="ECHO bot ok")
+
+
+async def start_web():
+    app = web.Application()
+    app.router.add_post("/register", handle_register)
+    app.router.add_options("/register", handle_options)
+    app.router.add_get("/", handle_health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("web endpoint listening on :%d  (POST /register)", PORT)
+
+
+# ---------------- startup ----------------
 async def on_startup():
-    # persistent "Play ECHO" button at the bottom-left of every private chat
     try:
         await bot.set_chat_menu_button(
             menu_button=MenuButtonWebApp(text="Play ECHO", web_app=WebAppInfo(url=GAME_URL))
@@ -194,6 +346,7 @@ async def on_startup():
 
 async def main():
     await on_startup()
+    await start_web()
     asyncio.create_task(scheduler())
     log.info("ECHO bot started. game=%s daily=%02d:%02d UTC", GAME_URL, DAILY_HOUR_UTC, DAILY_MINUTE_UTC)
     await dp.start_polling(bot)

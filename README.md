@@ -1,18 +1,39 @@
-# ECHO Universe — Game Bot (Python / aiogram v3)
+# ECHO Universe — Game Bot + In‑Game Daily Opt‑In (Python / aiogram v3)
 
-A dedicated Telegram bot for the ECHO game: a **Play ECHO** button that opens the Mini App, and a **daily reminder** that brings players back to ECHO's daily word. Runs on Railway as a long‑polling worker.
+A Telegram bot for the ECHO game: a **Play ECHO** Mini App button, a **daily reminder**,
+and — new — an **in‑game button** that lets any player who opens the game *inside Telegram*
+subscribe to ECHO's daily word **without typing `/start`**.
+
+---
+
+## What changed in this version
+1. **In‑game opt‑in.** The game now shows a button “🔔 فعّل التحديثات والمهام اليومية”.
+   When a player taps it, Telegram asks permission (`requestWriteAccess`), and the game
+   sends the player's signed identity to the bot, which auto‑subscribes them.
+2. **Bot now serves a web endpoint** (`POST /register`) to receive that. So the bot is now a
+   **web** service (not a worker) — `Procfile` = `web: python bot.py`.
+3. **No more skipped days.** The scheduler now records the last day it sent and runs a
+   **startup catch‑up**, so a redeploy after the daily time still sends today's reminder.
+4. **Group‑safe daily send.** If a subscriber is a group (where WebApp buttons aren't allowed),
+   the daily message is resent with a plain link button instead of failing silently.
+
+> ⚠️ Telegram rule: a bot can only message people who started it **or** who granted write
+> access via the Mini App. Players who open the game in a **normal browser** (not inside
+> Telegram) can't be reached — that's a Telegram limitation, not a bug. The in‑game button is
+> hidden for them automatically.
 
 ---
 
 ## 1) Create the bot in BotFather
-1. Open **@BotFather** → `/newbot` → choose a name and username (e.g. `EchoUniverseGameBot`).
-2. Copy the **token** (BOT_TOKEN) — you'll paste it into Railway.
-3. (Optional) `/setdescription` and `/setuserpic` for the bot's identity. The **Play ECHO** button is set automatically by the code on startup.
+1. `@BotFather` → `/newbot` → name + username.
+2. Copy the **token** (BOT_TOKEN).
 
-## 2) Deploy on Railway
-1. Railway → **New Service** → from a Git repo containing these files (or upload the folder).
-2. Railway auto-detects Python via `requirements.txt` and runs the `Procfile` (`worker: python bot.py`).
-3. **Variables** — add:
+## 2) Deploy on Railway (as a WEB service)
+1. Railway → New Service → from a repo with these files.
+2. Railway auto‑detects Python and runs the `Procfile` (`web: python bot.py`).
+3. **Generate a public domain:** Railway → Service → **Settings → Networking → Generate Domain**.
+   You'll get something like `https://echo-bot-production.up.railway.app`. **Copy it.**
+4. **Variables** — add:
 
 | Variable | Value |
 |---|---|
@@ -21,44 +42,45 @@ A dedicated Telegram bot for the ECHO game: a **Play ECHO** button that opens th
 | `DAILY_HOUR_UTC` | `6`  ← 6 UTC = 9:00 AM Riyadh |
 | `DAILY_MINUTE_UTC` | `0` |
 | `DATA_DIR` | `/data` |
-| `ADMIN_ID` | (optional) your numeric id — enables `/testdaily` broadcast |
+| `ADMIN_ID` | your numeric id (for `/id`, `/testdaily`) |
 
-4. **Important — add a Volume for persistence:** Railway → Service → **Volumes** → create a Volume mounted at `/data`. Without it, the subscriber list is lost on every redeploy (Railway's filesystem is ephemeral).
+5. **Add a Volume mounted at `/data`** (Railway → Volumes). Without it, the subscriber list
+   is wiped on every redeploy and nobody receives the daily word. **This is required.**
 
-## 3) Daily reminder time
-Time is in **UTC**. Riyadh = UTC+3, so subtract 3 hours:
-- 9:00 AM Riyadh → `DAILY_HOUR_UTC=6`
-- 8:00 PM Riyadh → `DAILY_HOUR_UTC=17`
+## 3) Point the game at the bot
+In `index.html`, find this line (near the top of the main script) and replace the URL with the
+Railway domain from step 2 **plus `/register`**:
 
-## 4) Invite the group to test
-- Share the bot link: `https://t.me/EchoUniverseGameBot` (replace with your bot's username).
-- Anyone who taps **Start** is auto-subscribed to the daily word and gets the **Play ECHO** button under the chat.
-- Note: Mini App buttons work in private chats; in a group, share the bot link (not a WebApp button).
+```js
+const ECHO_REGISTER_URL = 'https://YOUR-BOT.up.railway.app/register';  // 👈 REPLACE THIS
+```
+
+Then redeploy the game to Netlify. Done.
+
+## 4) Daily reminder time (UTC)
+Riyadh = UTC+3, so subtract 3 hours: 9:00 AM Riyadh → `DAILY_HOUR_UTC=6`; 8:00 PM → `17`.
 
 ## Commands
-- `/start` — welcome + play button + subscribe to the daily word (everyone)
+- `/start` — welcome + play button + subscribe (everyone)
 - `/play` — resend the play button (everyone)
 - `/stop` — turn off the daily reminder (everyone)
-- `/id` — shows your chat id (**admin only**, ignored for others)
-- `/testdaily` — broadcast today's reminder to all subscribers now (**admin only**, ignored for others)
+- `/id` — shows your chat id (**admin only**)
+- `/testdaily` — broadcast today's reminder to all subscribers now (**admin only**)
 
-## Admin
-`ADMIN_ID` defaults to the owner's Telegram id in the code. Only that user can use `/id` and `/testdaily`; for everyone else these commands are silently ignored. To change the admin, set the `ADMIN_ID` variable in Railway.
-
-## Test the daily reminder instantly (no waiting for the scheduled time)
-1. Send `/start` to the bot (you become a subscriber).
-2. As the admin, send `/testdaily` — the bot sends today's reminder to **all subscribers** immediately (a real test). You'll see a "sent=N" line in the Railway logs.
+## How to confirm it actually sent
+- Railway logs show `daily broadcast: sent=N removed=M`. `sent=N` (N>0) = it reached N players.
+- `daily: no subscribers yet` or `sent=0` = the subscriber list is empty (check the Volume).
+- Fastest live test: `/start` first so you're subscribed, then `/testdaily` — you should
+  receive the “🔥 Open today's word” message yourself.
 
 ## Project files
-- `bot.py` — the bot (aiogram v3)
-- `requirements.txt` — dependencies
-- `Procfile` — Railway start command
-- `.env.example` — variable template (for local runs: copy it to `.env`)
-- `runtime.txt` — Python version
+- `bot.py` — the bot (aiogram v3 + aiohttp web endpoint)
+- `index.html` — the game (with the in‑game opt‑in button)
+- `requirements.txt`, `runtime.txt`, `Procfile`, `.env.example`
 
 ## Run locally (optional)
 ```bash
 pip install -r requirements.txt
-export BOT_TOKEN=xxxx GAME_URL=https://echo-games.netlify.app DATA_DIR=.
+export BOT_TOKEN=xxxx GAME_URL=https://echo-games.netlify.app DATA_DIR=. PORT=8080
 python bot.py
 ```
