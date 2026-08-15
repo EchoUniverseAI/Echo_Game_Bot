@@ -41,6 +41,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     MenuButtonWebApp,
@@ -58,6 +61,7 @@ SUBS_FILE = os.path.join(DATA_DIR, "subscribers.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 ADMIN_ID = os.environ.get("ADMIN_ID", "6058949586")  # owner id — only this user can use /id and /testdaily
 PORT = int(os.environ.get("PORT", "8080"))
+STATS_STRIP_DAYS = int(os.environ.get("STATS_STRIP_DAYS", "7"))  # length of the day-by-day strip in /stats
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("echo-bot")
@@ -103,6 +107,16 @@ def save_state(state: dict) -> None:
         log.warning("could not save state: %s", e)
 
 
+def record_join(cid: int) -> None:
+    """Remember the day this id first subscribed (for growth stats)."""
+    state = load_state()
+    joins = state.setdefault("joins", {})
+    key = str(cid)
+    if key not in joins:
+        joins[key] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        save_state(state)
+
+
 def add_subscriber(cid: int) -> bool:
     """Add a chat id. Returns True if it was newly added."""
     subs = load_subs()
@@ -110,6 +124,7 @@ def add_subscriber(cid: int) -> bool:
         return False
     subs.add(cid)
     save_subs(subs)
+    record_join(cid)
     return True
 
 
@@ -164,6 +179,47 @@ async def cmd_id(m: Message):
     if not _is_admin(m):
         return
     await m.answer(f"Your chat id: <code>{m.chat.id}</code>")
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(m: Message):
+    # admin-only; shows what the bot has recorded
+    if not _is_admin(m):
+        return
+    subs = sorted(load_subs())
+    state = load_state()
+    last_sent = state.get("last_sent") or "—"
+    joins = state.get("joins", {})
+    now = datetime.now(timezone.utc)
+    # cumulative buckets: new signups within the last N days
+    def since(n_days: int) -> int:
+        cut = (now - timedelta(days=n_days - 1)).strftime("%Y-%m-%d")
+        return sum(1 for d in joins.values() if d >= cut)
+
+    b1, b3, b7, b14 = since(1), since(3), since(7), since(14)
+
+    # compact day-by-day strip for the last STATS_STRIP_DAYS days
+    day_counts = {}
+    for d in joins.values():
+        day_counts[d] = day_counts.get(d, 0) + 1
+    daily_lines = []
+    for i in range(STATS_STRIP_DAYS):
+        d = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        c = day_counts.get(d, 0)
+        bar = "▪" * min(c, 20)
+        tag = "  (today)" if i == 0 else ("  (yesterday)" if i == 1 else "")
+        daily_lines.append(f"{d}  {c:>3}  {bar}{tag}")
+    daily_block = "\n".join(daily_lines)
+
+    await m.answer(
+        "\U0001f4ca <b>ECHO game bot</b>\n"
+        f"Total subscribers: <b>{len(subs)}</b>\n"
+        f"Last daily sent: <b>{last_sent}</b>  ·  daily {DAILY_HOUR_UTC:02d}:{DAILY_MINUTE_UTC:02d} UTC\n"
+        "\n<b>New signups</b>\n"
+        f"Today: <b>{b1}</b>  ·  3d: <b>{b3}</b>  ·  7d: <b>{b7}</b>  ·  14d: <b>{b14}</b>\n"
+        f"\n<b>Day by day (last {STATS_STRIP_DAYS})</b>\n"
+        f"<code>{daily_block}</code>"
+    )
 
 
 @dp.message(Command("testdaily"))
@@ -334,6 +390,28 @@ async def start_web():
 
 
 # ---------------- startup ----------------
+async def setup_commands():
+    """Public users see only start/play/stop. Admin also sees the tracking
+    commands in their own command menu."""
+    public = [
+        BotCommand(command="start", description="Play ECHO + daily word"),
+        BotCommand(command="play", description="Open the game"),
+        BotCommand(command="stop", description="Stop the daily reminder"),
+    ]
+    try:
+        await bot.set_my_commands(public, scope=BotCommandScopeDefault())
+        if ADMIN_ID:
+            admin = public + [
+                BotCommand(command="stats", description="(admin) subscribers & growth"),
+                BotCommand(command="testdaily", description="(admin) send today's word now"),
+                BotCommand(command="id", description="(admin) show chat id"),
+            ]
+            await bot.set_my_commands(admin, scope=BotCommandScopeChat(chat_id=int(ADMIN_ID)))
+        log.info("bot commands set (public + admin scope)")
+    except Exception as e:
+        log.warning("could not set commands: %s", e)
+
+
 async def on_startup():
     try:
         await bot.set_chat_menu_button(
@@ -342,6 +420,7 @@ async def on_startup():
         log.info("menu button set to Mini App")
     except Exception as e:
         log.warning("could not set menu button: %s", e)
+    await setup_commands()
 
 
 async def main():
