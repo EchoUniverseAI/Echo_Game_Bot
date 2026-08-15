@@ -44,6 +44,7 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     MenuButtonWebApp,
@@ -222,6 +223,90 @@ async def cmd_stats(m: Message):
     )
 
 
+@dp.message(Command("help"))
+async def cmd_help(m: Message):
+    lines = [
+        "\U0001f441️ <b>ECHO game bot</b>",
+        "",
+        "/start — play ECHO + get the daily word",
+        "/play — open the game",
+        "/stop — turn off the daily reminder",
+    ]
+    if _is_admin(m):
+        lines += [
+            "",
+            "<b>Admin</b>",
+            "/stats — subscribers & daily growth",
+            "/broadcast — message all subscribers",
+            "/testdaily — send today's word now",
+            "/export — download the subscribers file",
+            "/id — show your chat id",
+        ]
+    await m.answer("\n".join(lines))
+
+
+@dp.message(Command("export"))
+async def cmd_export(m: Message):
+    # admin-only: download subscribers + join dates as CSV
+    if not _is_admin(m):
+        return
+    subs = sorted(load_subs())
+    joins = load_state().get("joins", {})
+    rows = ["chat_id,joined"]
+    for c in subs:
+        rows.append(f"{c},{joins.get(str(c), '')}")
+    data = ("\n".join(rows) + "\n").encode("utf-8")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    doc = BufferedInputFile(data, filename=f"echo_subscribers_{stamp}.csv")
+    await bot.send_document(m.chat.id, doc, caption=f"{len(subs)} subscribers")
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(m: Message):
+    # admin-only: send a custom message to every subscriber
+    if not _is_admin(m):
+        return
+    text = ""
+    if m.text:
+        parts = m.text.split(maxsplit=1)
+        text = parts[1].strip() if len(parts) > 1 else ""
+    if not text and m.reply_to_message:
+        text = m.reply_to_message.text or m.reply_to_message.caption or ""
+    if not text:
+        await m.answer(
+            "Usage: <code>/broadcast your message here</code>\n"
+            "or reply to any message with <code>/broadcast</code> to send that message."
+        )
+        return
+
+    subs = load_subs()
+    if not subs:
+        await m.answer("No subscribers yet.")
+        return
+
+    await m.answer(f"Broadcasting to {len(subs)} subscribers… \U0001f4e2")
+    sent, dead = 0, []
+    for cid in list(subs):
+        try:
+            # parse_mode=None so arbitrary admin text can't break HTML parsing
+            await bot.send_message(cid, text, parse_mode=None)
+            sent += 1
+        except Exception as e:
+            s = str(e).lower()
+            if any(k in s for k in ("blocked", "deactivated", "chat not found", "user is deactivated")):
+                dead.append(cid)
+            else:
+                log.warning("broadcast to %s failed: %s", cid, e)
+        await asyncio.sleep(0.05)
+    if dead:
+        subs = load_subs()
+        for c in dead:
+            subs.discard(c)
+        save_subs(subs)
+    await m.answer(f"Done ✅ sent={sent} removed={len(dead)}")
+    log.info("broadcast: sent=%d removed=%d", sent, len(dead))
+
+
 @dp.message(Command("testdaily"))
 async def cmd_testdaily(m: Message):
     if not _is_admin(m):
@@ -397,13 +482,16 @@ async def setup_commands():
         BotCommand(command="start", description="Play ECHO + daily word"),
         BotCommand(command="play", description="Open the game"),
         BotCommand(command="stop", description="Stop the daily reminder"),
+        BotCommand(command="help", description="Show available commands"),
     ]
     try:
         await bot.set_my_commands(public, scope=BotCommandScopeDefault())
         if ADMIN_ID:
             admin = public + [
                 BotCommand(command="stats", description="(admin) subscribers & growth"),
+                BotCommand(command="broadcast", description="(admin) message all subscribers"),
                 BotCommand(command="testdaily", description="(admin) send today's word now"),
+                BotCommand(command="export", description="(admin) download subscribers CSV"),
                 BotCommand(command="id", description="(admin) show chat id"),
             ]
             await bot.set_my_commands(admin, scope=BotCommandScopeChat(chat_id=int(ADMIN_ID)))
