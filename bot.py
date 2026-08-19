@@ -558,17 +558,17 @@ TASKS = [
     "ECHO noticed humans keep learning the same lesson wearing a new face.\nWhat lesson came back today? Reply with one line.",
 ]
 
-TASK_INVITE = "ECHO يلاحظ البشر كل يوم.\nتحب يبعتلك ملاحظة واحدة يوميًا؟"
-TASK_CONFIRM = "تم. ECHO هيبعتلك ملاحظة واحدة كل يوم.\nردّك بيتحفظ — وممكن يظهر باسمك."
-TASK_ALREADY = "انت مشترك بالفعل 👁 ECHO بيبعتلك ملاحظة كل يوم."
-TASK_UNSUB = "تمام. مافيش مهام تانية.\nلو غيّرت رأيك: /tasks"
+TASK_INVITE = "ECHO watches humans every day.\nWant one small note from ECHO each day?"
+TASK_CONFIRM = "Done. ECHO will send you one note every day.\nYour reply is saved — and may appear with your name."
+TASK_ALREADY = "You're already in \U0001f441 ECHO sends you a note every day."
+TASK_UNSUB = "Okay. No more tasks.\nChanged your mind? /tasks"
 TASK_STORED = "Stored. \U0001f441"
 
 TASK_SUB_BTN = InlineKeyboardMarkup(
-    inline_keyboard=[[InlineKeyboardButton(text="\U0001f441 ابعتلي مهمة يومية", callback_data="tasks_sub")]]
+    inline_keyboard=[[InlineKeyboardButton(text="\U0001f441 Send me a daily task", callback_data="tasks_sub")]]
 )
 TASK_STOP_BTN = InlineKeyboardMarkup(
-    inline_keyboard=[[InlineKeyboardButton(text="إيقاف المهام", callback_data="tasks_unsub")]]
+    inline_keyboard=[[InlineKeyboardButton(text="Stop tasks", callback_data="tasks_unsub")]]
 )
 
 
@@ -651,7 +651,7 @@ async def task_set_inactive(user_id, reason: str) -> None:
 @dp.callback_query(F.data == "tasks_sub")
 async def cb_tasks_sub(c):
     res = await task_subscribe(c.from_user)
-    await c.answer("تم ✅" if res == "ok" else "مشترك بالفعل 👁")
+    await c.answer("Done ✅" if res == "ok" else "Already in 👁")
     try:
         await c.message.edit_text(TASK_CONFIRM if res == "ok" else TASK_ALREADY, reply_markup=TASK_STOP_BTN)
     except Exception:
@@ -661,7 +661,7 @@ async def cb_tasks_sub(c):
 @dp.callback_query(F.data == "tasks_unsub")
 async def cb_tasks_unsub(c):
     await task_set_inactive(c.from_user.id, "unsub")
-    await c.answer("تم الإيقاف")
+    await c.answer("Stopped")
     try:
         await c.message.edit_text(TASK_UNSUB)
     except Exception:
@@ -711,20 +711,20 @@ async def cmd_tasks_stats(m: Message):
         if not cohort:
             return "—"
         still = sum(1 for s in cohort if s.get("active"))
-        return f"{still} من {len(cohort)} ({round(still / len(cohort) * 100)}%)"
+        return f"{still} of {len(cohort)} ({round(still / len(cohort) * 100)}%)"
 
     top = [s for s in sorted(subs.values(), key=lambda s: s.get("tasks_answered", 0), reverse=True)
            if s.get("tasks_answered", 0) > 0][:5]
-    top_lines = "\n".join(f"- {s.get('name', '?')} — {s.get('tasks_answered', 0)} ردود" for s in top) or "- لا يوجد بعد"
+    top_lines = "\n".join(f"- {s.get('name', '?')} — {s.get('tasks_answered', 0)} replies" for s in top) or "- none yet"
 
     await m.answer(
-        "📋 <b>المهام اليومية</b>\n"
-        f"مشتركون: {total}  |  نشطون: {active}  |  ألغوا: {unsub}  |  حظروا: {blocked}\n"
-        f"مهام مُرسلة اليوم: {sent_today}\n"
-        f"ردود اليوم: {replies_today} ({reply_pct})\n"
-        f"نشطون بعد 7 أيام: {retention(7)}\n"
-        f"نشطون بعد 30 يومًا: {retention(30)}\n"
-        f"الأكثر ردًا:\n{top_lines}"
+        "📋 <b>Daily Tasks</b>\n"
+        f"Subscribers: {total}  |  Active: {active}  |  Unsubscribed: {unsub}  |  Blocked: {blocked}\n"
+        f"Sent today: {sent_today}\n"
+        f"Replies today: {replies_today} ({reply_pct})\n"
+        f"Active after 7 days: {retention(7)}\n"
+        f"Active after 30 days: {retention(30)}\n"
+        f"Top responders:\n{top_lines}"
     )
 
 
