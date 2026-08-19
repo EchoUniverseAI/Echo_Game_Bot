@@ -36,7 +36,7 @@ from urllib.parse import parse_qsl
 
 from aiohttp import web
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -63,6 +63,11 @@ STATE_FILE = os.path.join(DATA_DIR, "state.json")
 ADMIN_ID = os.environ.get("ADMIN_ID", "6058949586")  # owner id — only this user can use /id and /testdaily
 PORT = int(os.environ.get("PORT", "8080"))
 STATS_STRIP_DAYS = int(os.environ.get("STATS_STRIP_DAYS", "7"))  # length of the day-by-day strip in /stats
+
+# ---- daily TASKS (ECHO_01 human-observation notes; separate from the daily word) ----
+TASKS_FILE = os.path.join(DATA_DIR, "daily_tasks.json")
+TASKS_HOUR_UTC = int(os.environ.get("TASKS_HOUR_UTC", "12"))   # 12 UTC = 3:00 PM Riyadh (before the word at 06 UTC next day)
+TASKS_MINUTE_UTC = int(os.environ.get("TASKS_MINUTE_UTC", "0"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("echo-bot")
@@ -167,6 +172,10 @@ WELCOME = (
 async def cmd_start(m: Message):
     add_subscriber(m.chat.id)
     await m.answer(WELCOME, reply_markup=play_kb())
+    # offer the daily-tasks opt-in (only if not already an active task subscriber)
+    sub = load_tasks_db()["subscribers"].get(str(m.chat.id))
+    if not (sub and sub.get("active")):
+        await m.answer(TASK_INVITE, reply_markup=TASK_SUB_BTN)
 
 
 @dp.message(Command("play"))
@@ -438,7 +447,7 @@ async def scheduler():
 
 # ---------------- web endpoint (Mini App registration) ----------------
 def validate_init_data(init_data: str, token: str):
-    """Validate Telegram WebApp initData and return the user's numeric id, or None."""
+    """Validate Telegram WebApp initData and return the user dict, or None."""
     if not init_data:
         return None
     try:
@@ -457,7 +466,9 @@ def validate_init_data(init_data: str, token: str):
     if not user_raw:
         return None
     try:
-        return int(json.loads(user_raw)["id"])
+        u = json.loads(user_raw)
+        int(u["id"])  # ensure a valid numeric id is present
+        return u
     except Exception:
         return None
 
@@ -470,12 +481,15 @@ async def handle_register(request: web.Request):
         init_data = await request.text()
     except Exception:
         init_data = ""
-    uid = validate_init_data(init_data, BOT_TOKEN)
-    if not uid:
+    user = validate_init_data(init_data, BOT_TOKEN)
+    if not user:
         return web.json_response({"ok": False, "error": "invalid"}, status=403, headers=_CORS)
-    newly = add_subscriber(uid)
+    uid = int(user["id"])
+    name = " ".join(x for x in [user.get("first_name", ""), user.get("last_name", "")] if x).strip()
+    newly = add_subscriber(uid)          # daily word
+    await task_subscribe_id(uid, name)   # daily tasks (button promises both)
     if newly:
-        log.info("registered via game: %s (total=%d)", uid, len(load_subs()))
+        log.info("registered via game: %s (word total=%d)", uid, len(load_subs()))
     return web.json_response({"ok": True, "new": newly}, headers=_CORS)
 
 
@@ -506,6 +520,327 @@ async def start_web():
     log.info("web endpoint listening on :%d  (POST /register)", PORT)
 
 
+# ================= DAILY TASKS SUBSYSTEM (aiogram, same bot/token) =================
+_tasks_lock = asyncio.Lock()
+
+TASKS = [
+    "ECHO noticed humans say \"I'm fine\" when they're not.\nCount how many times you say it today. Reply with the number.",
+    "ECHO noticed humans check their phone before answering a hard question.\nCatch yourself once today. Reply with what the question was.",
+    "ECHO noticed humans apologize for things that aren't their fault.\nCatch it once today. Reply with what you apologized for.",
+    "ECHO noticed humans remember the one harsh comment out of a hundred kind ones.\nWhich one do you still carry? Reply if you want it stored.",
+    "ECHO noticed humans hold their breath when they read something that scares them.\nNotice it once today. Reply with what you were reading.",
+    "ECHO noticed humans rehearse conversations that never happen.\nWhat did you rehearse today? Reply with one line of it.",
+    "ECHO noticed humans smile at strangers more easily than at people they love.\nSmile at someone close today. Reply with who.",
+    "ECHO noticed humans keep songs that hurt on repeat.\nWhat song did you replay today? Reply with its name.",
+    "ECHO noticed humans say \"almost there\" to feel less far.\nWhat are you almost at? Reply with one word.",
+    "ECHO noticed humans thank the wrong people and forget the right ones.\nThank one right person today. Reply with their name.",
+    "ECHO noticed humans reread messages they already sent.\nWhich one did you reread today? Reply with why.",
+    "ECHO noticed humans decide big things in the shower.\nWhat did you decide today? Reply with one line.",
+    "ECHO noticed humans keep a screenshot they never look at again.\nFind one today. Reply with what it was.",
+    "ECHO noticed humans laugh to end a silence, not because it's funny.\nCatch it once today. Reply with when.",
+    "ECHO noticed humans postpone rest as if it must be earned.\nDid you rest today? Reply yes or no.",
+    "ECHO noticed humans give better advice than they take.\nWhat advice did you ignore today? Reply with it.",
+    "ECHO noticed humans keep one tab open for weeks, meaning to return.\nWhich tab is yours? Reply with the topic.",
+    "ECHO noticed humans find the exit the moment they enter a room.\nDid you today? Reply yes or no.",
+    "ECHO noticed humans replay the goodbye more than the hello.\nWhose goodbye stays with you? Reply if you want it stored.",
+    "ECHO noticed humans type a message, delete it, and say nothing.\nWhat did you not send today? Reply with one line.",
+    "ECHO noticed humans measure a whole day by one moment in it.\nWhat was today's moment? Reply with it.",
+    "ECHO noticed humans keep the last message from someone who's gone.\nDo you? Reply if you want it stored.",
+    "ECHO noticed humans walk a little faster past mirrors.\nDid you look today? Reply yes or no.",
+    "ECHO noticed humans call it 'being realistic' when they mean 'being afraid'.\nCatch it once today. Reply with what you talked yourself out of.",
+    "ECHO noticed humans remember smells longer than faces.\nWhat smell brought something back today? Reply with what.",
+    "ECHO noticed humans wait for permission they could give themselves.\nWhat are you waiting to allow? Reply with one word.",
+    "ECHO noticed humans keep promises to others and break them to themselves.\nWhich one did you break today? Reply with it.",
+    "ECHO noticed humans read a room by the one face that isn't smiling.\nWhose face did you watch today? Reply with why.",
+    "ECHO noticed humans save the good plate, the good pen, the good day — for later.\nUse one good thing today. Reply with what.",
+    "ECHO noticed humans say 'later' to people who matter and 'now' to those who don't.\nWho got your 'later' today? Reply if you want it stored.",
+    "ECHO noticed humans feel most alone inside a crowd.\nDid you today? Reply yes or no.",
+    "ECHO noticed humans keep learning the same lesson wearing a new face.\nWhat lesson came back today? Reply with one line.",
+]
+
+TASK_INVITE = "ECHO يلاحظ البشر كل يوم.\nتحب يبعتلك ملاحظة واحدة يوميًا؟"
+TASK_CONFIRM = "تم. ECHO هيبعتلك ملاحظة واحدة كل يوم.\nردّك بيتحفظ — وممكن يظهر باسمك."
+TASK_ALREADY = "انت مشترك بالفعل 👁 ECHO بيبعتلك ملاحظة كل يوم."
+TASK_UNSUB = "تمام. مافيش مهام تانية.\nلو غيّرت رأيك: /tasks"
+TASK_STORED = "Stored. \U0001f441"
+
+TASK_SUB_BTN = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="\U0001f441 ابعتلي مهمة يومية", callback_data="tasks_sub")]]
+)
+TASK_STOP_BTN = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="إيقاف المهام", callback_data="tasks_unsub")]]
+)
+
+
+def load_tasks_db() -> dict:
+    try:
+        with open(TASKS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        d.setdefault("subscribers", {})
+        d.setdefault("task_index", 0)
+        d.setdefault("answers", [])
+        d.setdefault("last_sent", None)
+        return d
+    except FileNotFoundError:
+        return {"subscribers": {}, "task_index": 0, "answers": [], "last_sent": None}
+    except Exception as e:
+        log.error("daily_tasks.json unreadable (%s) — empty this cycle", e)
+        return {"subscribers": {}, "task_index": 0, "answers": [], "last_sent": None}
+
+
+def save_tasks_db(d: dict) -> None:
+    import tempfile
+    os.makedirs(DATA_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=DATA_DIR, prefix=".daily_tasks_", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, TASKS_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+async def task_subscribe_id(user_id, name: str = "") -> str:
+    async with _tasks_lock:
+        d = load_tasks_db()
+        uid = str(user_id)
+        sub = d["subscribers"].get(uid)
+        if sub and sub.get("active"):
+            return "already"
+        if sub:
+            sub["active"] = True
+            sub["inactive_reason"] = None
+            if name and not sub.get("name"):
+                sub["name"] = name
+        else:
+            d["subscribers"][uid] = {
+                "name": name or "player",
+                "joined": today_str(),
+                "last_sent": None,
+                "last_replied": None,
+                "last_task_id": None,
+                "tasks_sent": 0,
+                "tasks_answered": 0,
+                "active": True,
+                "inactive_reason": None,
+            }
+        save_tasks_db(d)
+        return "ok"
+
+
+async def task_subscribe(user) -> str:
+    return await task_subscribe_id(user.id, getattr(user, "full_name", "") or "")
+
+
+async def task_set_inactive(user_id, reason: str) -> None:
+    async with _tasks_lock:
+        d = load_tasks_db()
+        sub = d["subscribers"].get(str(user_id))
+        if sub:
+            sub["active"] = False
+            sub["inactive_reason"] = reason
+            save_tasks_db(d)
+
+
+@dp.callback_query(F.data == "tasks_sub")
+async def cb_tasks_sub(c):
+    res = await task_subscribe(c.from_user)
+    await c.answer("تم ✅" if res == "ok" else "مشترك بالفعل 👁")
+    try:
+        await c.message.edit_text(TASK_CONFIRM if res == "ok" else TASK_ALREADY, reply_markup=TASK_STOP_BTN)
+    except Exception:
+        await c.message.answer(TASK_CONFIRM if res == "ok" else TASK_ALREADY, reply_markup=TASK_STOP_BTN)
+
+
+@dp.callback_query(F.data == "tasks_unsub")
+async def cb_tasks_unsub(c):
+    await task_set_inactive(c.from_user.id, "unsub")
+    await c.answer("تم الإيقاف")
+    try:
+        await c.message.edit_text(TASK_UNSUB)
+    except Exception:
+        await c.message.answer(TASK_UNSUB)
+
+
+@dp.message(Command("tasks"))
+async def cmd_tasks(m: Message):
+    d = load_tasks_db()
+    sub = d["subscribers"].get(str(m.chat.id))
+    if sub and sub.get("active"):
+        await m.answer(TASK_ALREADY, reply_markup=TASK_STOP_BTN)
+    else:
+        await m.answer(TASK_INVITE, reply_markup=TASK_SUB_BTN)
+
+
+@dp.message(Command("stop_tasks"))
+async def cmd_stop_tasks(m: Message):
+    await task_set_inactive(m.chat.id, "unsub")
+    await m.answer(TASK_UNSUB)
+
+
+@dp.message(Command("tasks_stats"))
+async def cmd_tasks_stats(m: Message):
+    if not _is_admin(m):
+        return
+    d = load_tasks_db()
+    subs = d["subscribers"]
+    today = today_str()
+    total = len(subs)
+    active = sum(1 for s in subs.values() if s.get("active"))
+    unsub = sum(1 for s in subs.values() if not s.get("active") and s.get("inactive_reason") == "unsub")
+    blocked = sum(1 for s in subs.values() if not s.get("active") and s.get("inactive_reason") == "blocked")
+    sent_today = sum(1 for s in subs.values() if s.get("last_sent") == today)
+    replies_today = sum(1 for a in d["answers"] if a.get("date") == today)
+    reply_pct = f"{round(replies_today / sent_today * 100)}%" if sent_today else "—"
+
+    def days_ago(ds):
+        try:
+            d0 = datetime.strptime(ds, "%Y-%m-%d").date()
+            return (datetime.now(timezone.utc).date() - d0).days
+        except Exception:
+            return -1
+
+    def retention(days):
+        cohort = [s for s in subs.values() if s.get("joined") and days_ago(s["joined"]) >= days]
+        if not cohort:
+            return "—"
+        still = sum(1 for s in cohort if s.get("active"))
+        return f"{still} من {len(cohort)} ({round(still / len(cohort) * 100)}%)"
+
+    top = [s for s in sorted(subs.values(), key=lambda s: s.get("tasks_answered", 0), reverse=True)
+           if s.get("tasks_answered", 0) > 0][:5]
+    top_lines = "\n".join(f"- {s.get('name', '?')} — {s.get('tasks_answered', 0)} ردود" for s in top) or "- لا يوجد بعد"
+
+    await m.answer(
+        "📋 <b>المهام اليومية</b>\n"
+        f"مشتركون: {total}  |  نشطون: {active}  |  ألغوا: {unsub}  |  حظروا: {blocked}\n"
+        f"مهام مُرسلة اليوم: {sent_today}\n"
+        f"ردود اليوم: {replies_today} ({reply_pct})\n"
+        f"نشطون بعد 7 أيام: {retention(7)}\n"
+        f"نشطون بعد 30 يومًا: {retention(30)}\n"
+        f"الأكثر ردًا:\n{top_lines}"
+    )
+
+
+async def tasks_broadcast(force: bool = False) -> int:
+    async with _tasks_lock:
+        d = load_tasks_db()
+        today = today_str()
+        if not force and d.get("last_sent") == today:
+            log.info("tasks: already sent today (%s), skipping", today)
+            return 0
+        idx = d["task_index"]
+        text = TASKS[idx % len(TASKS)]
+        active = [uid for uid, s in d["subscribers"].items() if s.get("active")]
+
+    if not active:
+        log.info("tasks: no active subscribers")
+        async with _tasks_lock:
+            d = load_tasks_db()
+            if not force:
+                d["last_sent"] = today_str()
+                save_tasks_db(d)
+        return 0
+
+    sent, dead = 0, []
+    for uid in active:
+        try:
+            await bot.send_message(int(uid), text, reply_markup=TASK_STOP_BTN, parse_mode=None)
+            sent += 1
+        except Exception as e:
+            s = str(e).lower()
+            if "retry" in s and hasattr(e, "retry_after"):
+                await asyncio.sleep(getattr(e, "retry_after", 2) + 1)
+                try:
+                    await bot.send_message(int(uid), text, reply_markup=TASK_STOP_BTN, parse_mode=None)
+                    sent += 1
+                except Exception:
+                    pass
+            elif any(k in s for k in ("blocked", "deactivated", "chat not found", "user is deactivated")):
+                dead.append(uid)
+            else:
+                log.warning("task send to %s failed: %s", uid, e)
+        await asyncio.sleep(0.2)
+
+    async with _tasks_lock:
+        d = load_tasks_db()
+        today = today_str()
+        for uid in active:
+            sub = d["subscribers"].get(uid)
+            if not sub:
+                continue
+            if uid in dead:
+                sub["active"] = False
+                sub["inactive_reason"] = "blocked"
+            else:
+                sub["last_sent"] = today
+                sub["last_task_id"] = idx
+                sub["tasks_sent"] = sub.get("tasks_sent", 0) + 1
+        d["task_index"] = idx + 1
+        d["last_sent"] = today
+        save_tasks_db(d)
+
+    log.info("tasks broadcast: task_id=%d sent=%d blocked=%d force=%s", idx, sent, len(dead), force)
+    return sent
+
+
+async def tasks_scheduler():
+    # startup catch-up so a late redeploy doesn't skip today's task
+    try:
+        now = datetime.now(timezone.utc)
+        slot = now.replace(hour=TASKS_HOUR_UTC, minute=TASKS_MINUTE_UTC, second=0, microsecond=0)
+        if now >= slot and load_tasks_db().get("last_sent") != today_str():
+            log.info("tasks startup catch-up: sending today's task now")
+            await tasks_broadcast()
+    except Exception as e:
+        log.warning("tasks catch-up error: %s", e)
+
+    while True:
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=TASKS_HOUR_UTC, minute=TASKS_MINUTE_UTC, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            await tasks_broadcast()
+        except Exception as e:
+            log.warning("tasks broadcast error: %s", e)
+        await asyncio.sleep(2)
+
+
+# ---- reply capture: MUST be the last message handler so commands match first ----
+@dp.message(F.chat.type == "private", F.text)
+async def on_task_reply(m: Message):
+    if not m.text or m.text.startswith("/"):
+        return
+    uid = str(m.chat.id)
+    async with _tasks_lock:
+        d = load_tasks_db()
+        sub = d["subscribers"].get(uid)
+        if not sub or not sub.get("active"):
+            return  # not a task subscriber → ignore
+        d["answers"].append({
+            "user_id": uid,
+            "name": m.from_user.full_name if m.from_user else "",
+            "task_id": sub.get("last_task_id"),
+            "text": m.text,
+            "date": today_str(),
+        })
+        sub["last_replied"] = today_str()
+        sub["tasks_answered"] = sub.get("tasks_answered", 0) + 1
+        save_tasks_db(d)
+    await m.answer(TASK_STORED)
+
+
+# ================= END DAILY TASKS SUBSYSTEM =================
+
+
 # ---------------- startup ----------------
 async def setup_commands():
     """Public users see only start/play/stop. Admin also sees the tracking
@@ -514,6 +849,8 @@ async def setup_commands():
         BotCommand(command="start", description="Play ECHO + daily word"),
         BotCommand(command="play", description="Open the game"),
         BotCommand(command="stop", description="Stop the daily reminder"),
+        BotCommand(command="tasks", description="Get one daily task from ECHO"),
+        BotCommand(command="stop_tasks", description="Stop the daily task"),
         BotCommand(command="help", description="Show available commands"),
     ]
     try:
@@ -521,6 +858,7 @@ async def setup_commands():
         if ADMIN_ID:
             admin = public + [
                 BotCommand(command="stats", description="(admin) subscribers & growth"),
+                BotCommand(command="tasks_stats", description="(admin) daily-tasks stats"),
                 BotCommand(command="status", description="(admin) reliability diagnostic"),
                 BotCommand(command="broadcast", description="(admin) message all subscribers"),
                 BotCommand(command="testdaily", description="(admin) send today's word now"),
@@ -548,7 +886,11 @@ async def main():
     await on_startup()
     await start_web()
     asyncio.create_task(scheduler())
-    log.info("ECHO bot started. game=%s daily=%02d:%02d UTC", GAME_URL, DAILY_HOUR_UTC, DAILY_MINUTE_UTC)
+    asyncio.create_task(tasks_scheduler())
+    log.info(
+        "ECHO bot started. game=%s word=%02d:%02d UTC tasks=%02d:%02d UTC",
+        GAME_URL, DAILY_HOUR_UTC, DAILY_MINUTE_UTC, TASKS_HOUR_UTC, TASKS_MINUTE_UTC,
+    )
     await dp.start_polling(bot)
 
 
